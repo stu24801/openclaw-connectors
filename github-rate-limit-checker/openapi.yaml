@@ -1,0 +1,139 @@
+openapi: 3.0.1
+info:
+  title: GitHub Rate Limit
+  description: Check the rate limit status for the GitHub API.
+  version: 1.0.0
+servers:
+  - url: https://api.github.com
+paths:
+  /rate_limit:
+    get:
+      summary: Get rate limit status
+      description: Get the current rate limit status for the authenticated user or IP address.
+      operationId: GetRateLimit
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resources:
+                    type: object
+                    properties:
+                      core:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                            description: The maximum number of requests you can make per hour.
+                          remaining:
+                            type: integer
+                            description: The number of requests remaining in the current rate limit window.
+                          reset:
+                            type: integer
+                            description: The time at which the current rate limit window resets in UTC epoch seconds.
+                          used:
+                            type: integer
+                            description: The number of requests you have made in the current rate limit window.
+                      search:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      graphql:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      integration_manifest:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      source_import:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      code_scanning_upload:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      actions_runner_registration:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      scim:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                      dependency_snapshots:
+                        type: object
+                        properties:
+                          limit:
+                            type: integer
+                          remaining:
+                            type: integer
+                          reset:
+                            type: integer
+                            used:
+                              type: integer
+                  rate:
+                    type: object
+                    description: Deprecated. The rate object is deprecated.
+                    properties:
+                      limit:
+                        type: integer
+                      remaining:
+                        type: integer
+                      reset:
+                        type: integer
+                      used:
+                        type: integer
