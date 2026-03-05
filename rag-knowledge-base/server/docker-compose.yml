@@ -3,14 +3,44 @@ version: "3.9"
 services:
   rag:
     build: .
-    ports:
-      - "8765:8765"
+    expose:
+      - "8765"
     volumes:
-      - ./data:/app/data          # persistent FAISS index + uploaded files
+      - ./data:/app/data
     environment:
       RAG_DATA_DIR: /app/data
-      RAG_PASSWORD: changeme      # ← 改成你的密碼
+      RAG_PASSWORD: changeme        # ← 改成你的密碼
       RAG_CHUNK_SIZE: "500"
       RAG_TOP_K: "5"
-      # RAG_EMBED_MODEL: paraphrase-multilingual-MiniLM-L12-v2
     restart: unless-stopped
+    networks:
+      - ragnet
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certbot/www:/var/www/certbot:ro
+      - ./nginx/certbot/conf:/etc/letsencrypt:ro
+    depends_on:
+      - rag
+    restart: unless-stopped
+    networks:
+      - ragnet
+
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - ./nginx/certbot/www:/var/www/certbot
+      - ./nginx/certbot/conf:/etc/letsencrypt
+    # Run manually: docker compose run --rm certbot certonly ...
+    entrypoint: ["sh", "-c", "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"]
+    networks:
+      - ragnet
+
+networks:
+  ragnet:
+    driver: bridge

@@ -7,16 +7,35 @@ Supports `.txt`, `.md`, `.pdf` uploads, semantic search via sentence-transformer
 
 ---
 
+## Production URL
+
+**`https://rag.alex-stu24801.com`**  
+(nginx reverse proxy + Let's Encrypt TLS, auto-renew every 12h)
+
+---
+
 ## Setup
 
-### Option A — Docker Compose (recommended)
+### Option A — Docker Compose + SSL (production)
 
 ```bash
 cd rag-knowledge-base/server
 
-# 1. Set your password in docker-compose.yml → RAG_PASSWORD
-# 2. Launch
-docker compose up -d
+# 1. 確認 DNS：rag.alex-stu24801.com → 你的 VPS IP
+# 2. 編輯 init-ssl.sh，填入你的 email
+# 3. 編輯 docker-compose.yml，設定 RAG_PASSWORD
+# 4. 執行一次性 SSL 初始化
+bash init-ssl.sh
+```
+
+站點啟動在 **`https://rag.alex-stu24801.com`**
+
+### Option B — 本機開發（無 SSL）
+
+```bash
+cd rag-knowledge-base/server
+pip install -r requirements.txt
+RAG_PASSWORD=yourpassword uvicorn main:app --host 0.0.0.0 --port 8765
 ```
 
 Open **`http://localhost:8765`** → enter password → start uploading.
