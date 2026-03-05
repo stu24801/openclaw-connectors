@@ -1,0 +1,14 @@
+[Unit]
+Description=LLM Proxy (OpenAI-compatible via GitHub Copilot)
+After=network.target
+
+[Service]
+User=<your-user>
+WorkingDirectory=/opt/llm-proxy
+EnvironmentFile=/opt/llm-proxy/.env
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 9000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
