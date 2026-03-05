@@ -7,9 +7,10 @@ services:
       - "8765"
     volumes:
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
       RAG_DATA_DIR: /app/data
-      RAG_PASSWORD: changeme        # ← 改成你的密碼
       RAG_CHUNK_SIZE: "500"
       RAG_TOP_K: "5"
     restart: unless-stopped
@@ -36,7 +37,6 @@ services:
     volumes:
       - ./nginx/certbot/www:/var/www/certbot
       - ./nginx/certbot/conf:/etc/letsencrypt
-    # Run manually: docker compose run --rm certbot certonly ...
     entrypoint: ["sh", "-c", "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"]
     networks:
       - ragnet
