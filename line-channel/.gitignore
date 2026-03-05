@@ -1,4 +1,0 @@
-node_modules/
-cloudflared
-line_bridge.log
-.env
