@@ -1,0 +1,18 @@
+[Unit]
+Description=Docker TCP Port-Forward (%i)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+User=%u
+EnvironmentFile=%h/.config/portforward/%i.env
+ExecStart=/usr/bin/python3 %h/portforward-llm.py \
+    --listen-host ${LISTEN_HOST} \
+    --listen-port ${LISTEN_PORT} \
+    --dst-host    ${DST_HOST} \
+    --dst-port    ${DST_PORT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
