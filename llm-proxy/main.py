@@ -148,6 +148,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     if "image" in modalities:
         return await _chat_completions_gemini_image(req_id, model, messages, body)
 
+    # If any message contains image_url → route to Gemini vision (Copilot doesn't support vision)
+    has_image_url = any(
+        isinstance(msg.get("content"), list) and
+        any(p.get("type") == "image_url" for p in msg["content"] if isinstance(p, dict))
+        for msg in messages
+    )
+    if has_image_url:
+        return await _chat_completions_gemini_vision(req_id, messages)
+
     messages = await _maybe_inject_rag(messages)
 
     t0 = time.time()
@@ -266,6 +275,63 @@ def health():
         "token_valid":   token_ok,
         "rag_enabled":   bool(RAG_ENDPOINT),
     }
+
+# ── Gemini vision (text analysis with image input) ────────────────────────────
+async def _chat_completions_gemini_vision(req_id: str, messages: list) -> JSONResponse:
+    """Route vision requests (image_url content) to Gemini text API."""
+    api_key = GOOGLE_API_KEY
+    if not api_key:
+        raise HTTPException(502, "No GOOGLE_API_KEY configured for vision")
+
+    vision_model = "gemini-2.0-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{vision_model}:generateContent?key={api_key}"
+
+    parts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    parts.append({"text": part["text"]})
+                elif part.get("type") == "image_url":
+                    img_url = part.get("image_url", {}).get("url", "")
+                    if img_url.startswith("data:image"):
+                        mime, b64 = img_url.split(";base64,")
+                        mime = mime.split("data:")[-1]
+                        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+
+    payload = {"contents": [{"role": "user", "parts": parts}]}
+
+    t0 = time.time()
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, json=payload)
+        if not resp.is_success:
+            logger.error(f"[{req_id}] Gemini vision error {resp.status_code}: {resp.text[:200]}")
+            raise HTTPException(502, f"Gemini vision error: {resp.status_code}")
+        data = resp.json()
+
+    text = ""
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        text = str(data)
+
+    elapsed = time.time() - t0
+    logger.info(f"[{req_id}] gemini-vision out={len(text)}chars elapsed={elapsed:.1f}s")
+
+    return JSONResponse({
+        "id": f"chatcmpl-{req_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": vision_model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": len(text) // 4, "total_tokens": len(text) // 4}
+    })
+
 
 # ── Gemini image generation (for banana-slides) ───────────────────────────────
 async def _call_gemini_image(model: str, prompt: str, images_b64: list = None,
