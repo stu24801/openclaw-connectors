@@ -1,0 +1,4 @@
+# 絕對不要 commit 這些檔案
+.env
+data/
+nginx/certbot/
