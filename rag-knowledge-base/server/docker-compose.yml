@@ -6,9 +6,10 @@ services:
     ports:
       - "8765:8765"
     volumes:
-      - ./data:/app/data          # persistent FAISS index + metadata
+      - ./data:/app/data          # persistent FAISS index + uploaded files
     environment:
       RAG_DATA_DIR: /app/data
+      RAG_PASSWORD: changeme      # ← 改成你的密碼
       RAG_CHUNK_SIZE: "500"
       RAG_TOP_K: "5"
       # RAG_EMBED_MODEL: paraphrase-multilingual-MiniLM-L12-v2

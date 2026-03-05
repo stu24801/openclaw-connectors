@@ -2,117 +2,98 @@
 
 ## Description
 
-A self-hosted HTTP server that lets you upload documents (`.txt`, `.md`, `.pdf`) and query them via semantic search.  
-The AI uses this as a **Retrieval-Augmented Generation (RAG)** knowledge base: before answering knowledge-heavy questions, it searches the base and incorporates the top results into its response.
+A self-hosted HTTP server with **web UI + password auth** for uploading documents and using them as a RAG knowledge base.  
+Supports `.txt`, `.md`, `.pdf` uploads, semantic search via sentence-transformers + FAISS, and a dark-mode dashboard.
 
 ---
 
-## Setup (one-time)
+## Setup
 
 ### Option A — Docker Compose (recommended)
 
 ```bash
 cd rag-knowledge-base/server
+
+# 1. Set your password in docker-compose.yml → RAG_PASSWORD
+# 2. Launch
 docker compose up -d
 ```
 
-Server starts on **`http://localhost:8765`** (or the host/port you expose).
+Open **`http://localhost:8765`** → enter password → start uploading.
 
 ### Option B — Direct Python
 
 ```bash
 cd rag-knowledge-base/server
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8765
+RAG_PASSWORD=yourpassword uvicorn main:app --host 0.0.0.0 --port 8765
 ```
-
-> First startup downloads the embedding model (~120 MB). Subsequent starts are instant.
 
 ---
 
-## Configuration (environment variables)
+## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `RAG_DATA_DIR` | `./data` | Where FAISS index + metadata are stored |
-| `RAG_CHUNK_SIZE` | `500` | Characters per chunk (overlap = 100 chars) |
-| `RAG_TOP_K` | `5` | Default number of results returned by `/search` |
-| `RAG_EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model (supports Chinese + English) |
+| `RAG_PASSWORD` | `changeme` | Web UI login password |
+| `RAG_DATA_DIR` | `./data` | Storage path for files + FAISS index |
+| `RAG_CHUNK_SIZE` | `500` | Characters per chunk |
+| `RAG_TOP_K` | `5` | Default search results count |
+| `RAG_EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Multilingual embedding model |
 
 ---
 
-## API Reference
+## Web UI Pages
+
+| Path | Description |
+|---|---|
+| `/` | Redirects to login or dashboard |
+| `/login` | Password login page |
+| `/dashboard` | Upload files, view file list with download/delete |
+| `/search_ui` | Browser-based semantic search |
+| `/logout` | Clear session |
+
+---
+
+## JSON API (for AI use — no auth required for read)
 
 ### `GET /health`
-Check server status.
 ```json
-{ "status": "ok", "ready": true, "doc_count": 42, "sources": ["manual.md", "faq.txt"] }
+{ "status": "ok", "ready": true, "doc_count": 42, "sources": ["manual.md"] }
 ```
 
-### `POST /upload` — multipart file upload
-```bash
-curl -X POST http://localhost:8765/upload \
-  -F "file=@/path/to/document.md" \
-  -F "source_name=my-doc"
-```
-Supports: `.txt`, `.md`, `.pdf` (pdfplumber must be installed for PDF).
-
-### `POST /upload_text` — plain JSON upload
-```bash
-curl -X POST http://localhost:8765/upload_text \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Your document text here...", "source": "inline-note"}'
-```
-
-### `GET /search?q=<query>&top_k=5&source=<optional>`
+### `GET /search?q=<query>&top_k=5`
+Returns top ranked chunks. The AI uses this for RAG.
 ```bash
 curl "http://localhost:8765/search?q=如何設定環境變數&top_k=3"
 ```
-Returns ranked chunks with score, source, and text.
+
+### `POST /upload_text`
+```json
+{ "text": "...", "source": "note-1" }
+```
 
 ### `GET /sources`
-List all uploaded sources and their chunk counts.
-
-### `DELETE /source/{source_name}`
-Remove a source and rebuild the index.
+List all indexed sources.
 
 ---
 
 ## AI Operating Instructions
 
-> **When to use this skill:**  
-> When the user asks a question that likely requires domain-specific knowledge (e.g., product manuals, internal docs, past conversations), first call `/search` to retrieve relevant context, then answer using that context.
+> Use this skill when the user asks questions that require domain knowledge stored in the knowledge base.
 
-### Step-by-step workflow
+### Workflow
 
-1. **Check health first** — `GET /health`  
-   - If `ready: false`, inform the user the server is not running.
-   - If `doc_count: 0`, inform the user the knowledge base is empty.
+1. **Check server** — `GET /health`  
+   - `ready: false` → server not running, ask user to start it.  
+   - `doc_count: 0` → knowledge base is empty.
 
 2. **Search** — `GET /search?q=<user question>&top_k=5`  
-   - Use the user's question (or a cleaned-up version) as `q`.
-   - If the user specifies a document/source, add `&source=<name>`.
+   - Use the user's question as `q`.  
+   - `results[].text` → use as grounding context.  
+   - Cite source: `（來源：{source}）`
 
-3. **Incorporate results** — Treat the returned `text` fields as grounding context.  
-   - Cite the source name when relevant: `（來源：{source}）`
-   - If no relevant chunks are found (`results: []`), say so and answer from general knowledge.
+3. **No results** → answer from general knowledge, note that the KB had no matching context.
 
-4. **Upload when asked** — If the user wants to add a document:
-   - Small text snippets → `POST /upload_text`
-   - Files → `POST /upload` with multipart
-
-### Example search call (pseudo-code)
-```
-GET http://localhost:8765/search?q={user_question}&top_k=5
-→ use result[0..4].text as context
-→ answer the user
-```
-
----
-
-## Notes
-
-- The default embedding model supports **Traditional Chinese, Simplified Chinese, English, and Japanese**.
-- All data is stored **locally** in `./data/`. No data leaves your machine.
-- To reset everything: `rm -rf ./data/`
-- For PDF support: `pip install pdfplumber`
+4. **Upload via API** (when user pastes text) → `POST /upload_text`  
+   For files, direct user to the web UI (`/dashboard`).
