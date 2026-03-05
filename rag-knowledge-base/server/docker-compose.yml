@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  rag:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data          # persistent FAISS index + metadata
+    environment:
+      RAG_DATA_DIR: /app/data
+      RAG_CHUNK_SIZE: "500"
+      RAG_TOP_K: "5"
+      # RAG_EMBED_MODEL: paraphrase-multilingual-MiniLM-L12-v2
+    restart: unless-stopped
