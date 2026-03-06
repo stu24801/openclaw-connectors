@@ -1,88 +1,70 @@
+---
+name: rag-kb
+description: Query the local RAG Knowledge Base for domain-specific documents uploaded by the user. Use this when the user asks questions that may be answered by their personal knowledge base, uploaded documents, manuals, notes, or any custom content stored in the RAG system. The KB is hosted at http://localhost:8765.
+---
+
 # RAG Knowledge Base
 
-## Description
-
-A self-hosted HTTP server with **web UI + password auth** for uploading documents and using them as a RAG knowledge base.  
-Supports `.txt`, `.md`, `.pdf` uploads, semantic search via sentence-transformers + FAISS, and a dark-mode dashboard.
-
----
+Self-hosted knowledge base with web UI. Upload documents → semantic vector search powered by QMD (sqlite-vec + GGUF embeddings).
 
 ## Production URL
 
-**`https://rag.alex-stu24801.com`**  
-(nginx reverse proxy + Let's Encrypt TLS, auto-renew every 12h)
+**`https://rag.alex-stu24801.com`** (nginx + Let's Encrypt TLS)
 
 ---
 
 ## Setup
 
-### Option A — Docker Compose + SSL (production)
-
-```bash
-cd rag-knowledge-base/server
-
-# 1. 確認 DNS：rag.alex-stu24801.com → 你的 VPS IP
-# 2. 編輯 init-ssl.sh，填入你的 email
-# 3. 編輯 docker-compose.yml，設定 RAG_PASSWORD
-# 4. 執行一次性 SSL 初始化
-bash init-ssl.sh
-```
-
-站點啟動在 **`https://rag.alex-stu24801.com`**
-
-### Option B — 本機開發（無 SSL）
-
 ```bash
 cd rag-knowledge-base/server
 pip install -r requirements.txt
+# Set env vars in .env:
+#   RAG_PASSWORD=yourpassword
+#   QMD_BIN=/path/to/qmd   (e.g. /home/user/.npm-global/bin/qmd)
 RAG_PASSWORD=yourpassword uvicorn main:app --host 0.0.0.0 --port 8765
 ```
 
-Open **`http://localhost:8765`** → enter password → start uploading.
-
-### Option B — Direct Python
-
-```bash
-cd rag-knowledge-base/server
-pip install -r requirements.txt
-RAG_PASSWORD=yourpassword uvicorn main:app --host 0.0.0.0 --port 8765
-```
-
----
-
-## Environment Variables
+### systemd .env variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `RAG_PASSWORD` | `changeme` | Web UI login password |
-| `RAG_DATA_DIR` | `./data` | Storage path for files + FAISS index |
-| `RAG_CHUNK_SIZE` | `500` | Characters per chunk |
-| `RAG_TOP_K` | `5` | Default search results count |
-| `RAG_EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Multilingual embedding model |
+| `RAG_DATA_DIR` | `./data` | Storage path |
+| `QMD_BIN` | `qmd` | Full path to qmd binary |
+| `RAG_TOP_K` | `5` | Default search results |
 
 ---
 
-## Web UI Pages
+## Architecture
+
+Documents are written as markdown chunks into `$RAG_DATA_DIR/kb_docs/` which is a QMD collection (`rag-kb`). Embedding and retrieval are handled by QMD — the same SQLite index used by OpenClaw memory.
+
+```
+~/.cache/qmd/index.sqlite
+  ├── openclaw-engram/   ← OpenClaw memory
+  └── rag-kb/            ← uploaded documents
+```
+
+---
+
+## Web UI
 
 | Path | Description |
 |---|---|
-| `/` | Redirects to login or dashboard |
-| `/login` | Password login page |
-| `/dashboard` | Upload files, view file list with download/delete |
+| `/` | Login or dashboard |
+| `/dashboard` | Upload files (.txt/.md/.pdf), manage documents |
 | `/search_ui` | Browser-based semantic search |
-| `/logout` | Clear session |
 
 ---
 
-## JSON API (for AI use — no auth required for read)
+## JSON API (no auth required for read)
 
 ### `GET /health`
 ```json
-{ "status": "ok", "ready": true, "doc_count": 42, "sources": ["manual.md"] }
+{ "status": "ok", "backend": "qmd+sqlite-vec", "doc_count": 3 }
 ```
 
 ### `GET /search?q=<query>&top_k=5`
-Returns top ranked chunks. The AI uses this for RAG.
 ```bash
 curl "http://localhost:8765/search?q=如何設定環境變數&top_k=3"
 ```
@@ -99,20 +81,7 @@ List all indexed sources.
 
 ## AI Operating Instructions
 
-> Use this skill when the user asks questions that require domain knowledge stored in the knowledge base.
-
-### Workflow
-
-1. **Check server** — `GET /health`  
-   - `ready: false` → server not running, ask user to start it.  
-   - `doc_count: 0` → knowledge base is empty.
-
-2. **Search** — `GET /search?q=<user question>&top_k=5`  
-   - Use the user's question as `q`.  
-   - `results[].text` → use as grounding context.  
-   - Cite source: `（來源：{source}）`
-
-3. **No results** → answer from general knowledge, note that the KB had no matching context.
-
-4. **Upload via API** (when user pastes text) → `POST /upload_text`  
-   For files, direct user to the web UI (`/dashboard`).
+1. **Search first** — `GET /search?q=<user question>` before answering from general knowledge
+2. **Cite source** — use `（來源：{title}）` from results
+3. **No results** → answer from general knowledge, note KB had no match
+4. **New uploads** → embedding runs async, wait ~10s before searching
