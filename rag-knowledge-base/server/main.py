@@ -1,8 +1,9 @@
 """
-RAG Knowledge Base Server — with Web UI + Password Auth
+RAG Knowledge Base Server — QMD-backed (sqlite-vec + GGUF embeddings)
+No sentence-transformers or faiss required.
 """
 
-import os, uuid, json, hashlib, secrets, io
+import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re
 from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
@@ -12,80 +13,91 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 
-try:
-    from sentence_transformers import SentenceTransformer
-    import faiss
-    READY = True
-except ImportError:
-    READY = False
-
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR    = Path(os.getenv("RAG_DATA_DIR", "./data"))
-FILES_DIR   = DATA_DIR / "files"          # uploaded raw files
-INDEX_PATH  = DATA_DIR / "index.faiss"
-META_PATH   = DATA_DIR / "meta.json"
+DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
+FILES_DIR     = DATA_DIR / "files"
+KB_DOCS_DIR   = DATA_DIR / "kb_docs"          # QMD collection dir (markdown files)
 FILEMETA_PATH = DATA_DIR / "filemeta.json"
-CHUNK_SIZE  = int(os.getenv("RAG_CHUNK_SIZE", "500"))
-TOP_K       = int(os.getenv("RAG_TOP_K", "5"))
-MODEL_NAME  = os.getenv("RAG_EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
-PASSWORD    = os.getenv("RAG_PASSWORD", "changeme")   # ← set via env
+QMD_BIN       = os.getenv("QMD_BIN", "qmd")   # path to qmd CLI
+QMD_COLL      = "rag-kb"
+TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
+PASSWORD      = os.getenv("RAG_PASSWORD", "changeme")
 
-# ── In-memory session store ───────────────────────────────────────────────────
-_sessions: set = set()   # valid session tokens
+# ── In-memory session store ────────────────────────────────────────────────────
+_sessions: set = set()
 
 app = FastAPI(title="RAG Knowledge Base")
 
-# ── Lazy globals ──────────────────────────────────────────────────────────────
-_model = None
-_index = None
-_meta: List[dict] = []
-_filemeta: List[dict] = []   # [{id, filename, source_name, size, uploaded_at}, ...]
+# ── Filemeta helpers ──────────────────────────────────────────────────────────
+_filemeta: List[dict] = []
 
-def _get_model():
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(MODEL_NAME)
-    return _model
-
-def _load_store():
-    global _index, _meta, _filemeta
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    _meta     = json.loads(META_PATH.read_text())     if META_PATH.exists()     else []
+def _load_filemeta():
+    global _filemeta
     _filemeta = json.loads(FILEMETA_PATH.read_text()) if FILEMETA_PATH.exists() else []
-    if INDEX_PATH.exists() and _meta:
-        _index = faiss.read_index(str(INDEX_PATH))
 
-def _save_store():
-    META_PATH.write_text(json.dumps(_meta, ensure_ascii=False, indent=2))
+def _save_filemeta():
     FILEMETA_PATH.write_text(json.dumps(_filemeta, ensure_ascii=False, indent=2))
-    if _index is not None:
-        faiss.write_index(_index, str(INDEX_PATH))
 
-def _chunk_text(text: str) -> List[str]:
+# ── QMD helpers ───────────────────────────────────────────────────────────────
+
+def _qmd_update_embed():
+    """Re-index and embed the rag-kb collection (best-effort, background ok)."""
+    try:
+        subprocess.run([QMD_BIN, "update"], capture_output=True, timeout=120)
+        subprocess.run([QMD_BIN, "embed", "-f"], capture_output=True, timeout=300)
+    except Exception as e:
+        print(f"[qmd embed] warning: {e}")
+
+def _qmd_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
+    """Run qmd vsearch --json and return list of results."""
+    try:
+        result = subprocess.run(
+            [QMD_BIN, "vsearch", query, "--json", "-n", str(top_k * 3), f"qmd://{QMD_COLL}/"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout.strip())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[qmd vsearch] error: {e}")
+        return []
+
+def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 135) -> List[str]:
+    """Split text into overlapping chunks."""
     chunks, i = [], 0
     while i < len(text):
-        chunks.append(text[i:i + CHUNK_SIZE])
-        i += CHUNK_SIZE - 100
+        chunks.append(text[i:i + chunk_size])
+        i += chunk_size - overlap
     return [c for c in chunks if c.strip()]
 
-def _add_chunks(source: str, chunks: List[str]):
-    global _index, _meta
-    model = _get_model()
-    vecs  = model.encode(chunks, normalize_embeddings=True).astype("float32")
-    if _index is None:
-        _index = faiss.IndexFlatIP(vecs.shape[1])
-    _index.add(vecs)
+def _write_doc_to_kb(file_id: str, filename: str, source_name: str, text: str):
+    """Write document as markdown files in KB_DOCS_DIR for QMD indexing."""
+    doc_dir = KB_DOCS_DIR / file_id
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    chunks = _chunk_text(text)
     for i, chunk in enumerate(chunks):
-        _meta.append({"id": str(uuid.uuid4()), "source": source, "chunk_index": i, "text": chunk})
-    _save_store()
+        md_path = doc_dir / f"chunk_{i:04d}.md"
+        md_path.write_text(
+            f"---\nsource: {source_name}\nfilename: {filename}\nfile_id: {file_id}\nchunk: {i}\n---\n\n{chunk}",
+            encoding="utf-8"
+        )
+
+def _remove_doc_from_kb(file_id: str):
+    """Remove document chunks from KB_DOCS_DIR."""
+    doc_dir = KB_DOCS_DIR / file_id
+    if doc_dir.exists():
+        shutil.rmtree(doc_dir)
 
 def _auth(token: Optional[str]) -> bool:
     return token is not None and token in _sessions
 
 @app.on_event("startup")
 def startup():
-    _load_store()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    KB_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    _load_filemeta()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML helpers
@@ -144,6 +156,7 @@ def _base_html(body: str, title="RAG Knowledge Base") -> str:
 <body>
 <div class="topbar">
   <h1>🦐 RAG Knowledge Base</h1>
+  <a href="/slides/" target="_blank" style="margin-left:auto;background:#3b0764;color:#c4b5fd;padding:6px 14px;border-radius:8px;font-size:.82rem;font-weight:500;border:1px solid #6d28d9">🍌 Banana Slides</a>
   <a href="/logout">登出</a>
 </div>
 <div class="container">{body}</div>
@@ -205,16 +218,10 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
     if not _auth(rag_token):
         return RedirectResponse("/login")
 
-    # stats
-    from collections import Counter
-    src_counts = Counter(m["source"] for m in _meta)
-    doc_count  = len(_filemeta)
-    chunk_count = len(_meta)
-    src_count  = len(src_counts)
-
+    doc_count   = len(_filemeta)
+    chunk_count = sum(len(list((KB_DOCS_DIR / f["id"]).glob("chunk_*.md"))) for f in _filemeta if (KB_DOCS_DIR / f["id"]).exists())
     ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
 
-    # file table
     if _filemeta:
         rows = ""
         for f in reversed(_filemeta):
@@ -243,8 +250,7 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
 {ok_html}
 <div class="stats">
   <div class="stat"><span class="stat-val">{doc_count}</span> 份文件</div>
-  <div class="stat"><span class="stat-val">{chunk_count}</span> 個向量段落</div>
-  <div class="stat"><span class="stat-val">{src_count}</span> 個來源</div>
+  <div class="stat"><span class="stat-val">{chunk_count}</span> 個段落</div>
 </div>
 
 <div class="card">
@@ -298,7 +304,6 @@ async def upload_form(
     raw = await file.read()
     name = source_name.strip() if source_name and source_name.strip() else (file.filename or "unnamed")
 
-    # Decode text
     if file.filename and file.filename.lower().endswith(".pdf"):
         try:
             import pdfplumber
@@ -312,11 +317,12 @@ async def upload_form(
     else:
         text = raw.decode("utf-8", errors="replace")
 
-    # Save raw file
     file_id  = str(uuid.uuid4())
     save_ext = Path(file.filename).suffix if file.filename else ".txt"
     save_path = FILES_DIR / f"{file_id}{save_ext}"
     save_path.write_bytes(raw)
+
+    _write_doc_to_kb(file_id, file.filename or "unnamed", name, text)
 
     _filemeta.append({
         "id": file_id,
@@ -327,16 +333,13 @@ async def upload_form(
         "path": str(save_path),
         "ext": save_ext,
     })
+    _save_filemeta()
 
-    # Vectorize
-    if READY:
-        chunks = _chunk_text(text)
-        if chunks:
-            _add_chunks(name, chunks)
-    else:
-        _save_store()
+    # Update QMD index in background
+    import threading
+    threading.Thread(target=_qmd_update_embed, daemon=True).start()
 
-    return RedirectResponse(f"/dashboard?msg=上傳成功：{file.filename}（{len(text)}字）", status_code=303)
+    return RedirectResponse(f"/dashboard?msg=上傳成功：{file.filename}（{len(text)}字）已排入向量化", status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,32 +365,23 @@ def download(file_id: str, rag_token: Optional[str] = Cookie(None)):
 
 @app.post("/delete/{file_id}")
 def delete_file(file_id: str, rag_token: Optional[str] = Cookie(None)):
-    global _index, _meta, _filemeta
+    global _filemeta
     if not _auth(rag_token):
         return RedirectResponse("/login")
     fm = next((f for f in _filemeta if f["id"] == file_id), None)
     if not fm:
         raise HTTPException(404, "File not found")
 
-    # Delete raw file
     p = Path(fm["path"])
     if p.exists():
         p.unlink()
 
-    # Remove from filemeta
+    _remove_doc_from_kb(file_id)
     _filemeta = [f for f in _filemeta if f["id"] != file_id]
+    _save_filemeta()
 
-    # Remove chunks from vector store and rebuild
-    source = fm["source_name"]
-    _meta = [m for m in _meta if m["source"] != source]
-    if _meta and READY:
-        model = _get_model()
-        vecs  = model.encode([m["text"] for m in _meta], normalize_embeddings=True).astype("float32")
-        _index = faiss.IndexFlatIP(vecs.shape[1])
-        _index.add(vecs)
-    else:
-        _index = None
-    _save_store()
+    import threading
+    threading.Thread(target=_qmd_update_embed, daemon=True).start()
 
     return RedirectResponse(f"/dashboard?msg=已刪除：{fm['filename']}", status_code=303)
 
@@ -403,22 +397,20 @@ def search_ui(q: str = "", rag_token: Optional[str] = Cookie(None)):
 
     results_html = ""
     if q:
-        if not READY or _index is None:
-            results_html = '<div class="alert alert-error">知識庫為空或向量模組未安裝。</div>'
+        raw_results = _qmd_vsearch(q, TOP_K)
+        if not raw_results:
+            results_html = '<div class="alert alert-error">知識庫為空或尚未建立向量索引，請上傳文件後稍候再試。</div>'
         else:
-            model = _get_model()
-            vec   = model.encode([q], normalize_embeddings=True).astype("float32")
-            k     = min(TOP_K * 3, len(_meta))
-            scores, indices = _index.search(vec, k)
             rows = ""
-            for score, idx in zip(scores[0], indices[0]):
-                if idx < 0: continue
-                m = _meta[idx]
-                preview = m["text"][:300].replace("<","&lt;").replace(">","&gt;")
+            for r in raw_results[:TOP_K]:
+                score = r.get("score", 0)
+                source = r.get("title", r.get("file", "—"))
+                body_text = (r.get("body") or r.get("snippet") or "")[:300]
+                body_text = body_text.replace("<","&lt;").replace(">","&gt;")
                 rows += f"""<tr>
   <td style="color:#a78bfa;font-weight:600">{score:.3f}</td>
-  <td><span class="badge badge-purple">{m['source']}</span></td>
-  <td style="white-space:pre-wrap;font-size:.8rem;color:#cbd5e1">{preview}…</td>
+  <td><span class="badge badge-purple">{source}</span></td>
+  <td style="white-space:pre-wrap;font-size:.8rem;color:#cbd5e1">{body_text}…</td>
 </tr>"""
             if rows:
                 results_html = f"""<table>
@@ -448,36 +440,45 @@ def search_ui(q: str = "", rag_token: Optional[str] = Cookie(None)):
 
 @app.get("/health")
 def health():
-    return {"status":"ok","ready":READY,"doc_count":len(_meta),"sources":list({m["source"] for m in _meta})}
+    doc_count = len(_filemeta)
+    return {"status": "ok", "backend": "qmd+sqlite-vec", "doc_count": doc_count}
 
 @app.get("/search")
 def search_api(q: str, top_k: int = TOP_K, source: Optional[str] = None):
-    if not READY or _index is None:
-        return {"results":[], "note":"Knowledge base empty."}
-    model = _get_model()
-    vec   = model.encode([q], normalize_embeddings=True).astype("float32")
-    k     = min(top_k*3, len(_meta))
-    scores, indices = _index.search(vec, k)
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < 0: continue
-        m = _meta[idx]
-        if source and m["source"] != source: continue
-        results.append({"score":float(score),"source":m["source"],"chunk_index":m["chunk_index"],"text":m["text"]})
-        if len(results) >= top_k: break
-    return {"query":q,"results":results}
+    results = _qmd_vsearch(q, top_k)
+    if source:
+        results = [r for r in results if source.lower() in (r.get("title","") + r.get("file","")).lower()]
+    return {"query": q, "results": results[:top_k]}
 
 @app.post("/upload_text")
 async def upload_text_api(payload: dict):
-    text   = payload.get("text","")
-    source = payload.get("source","inline-"+str(uuid.uuid4())[:8])
-    if not text.strip(): raise HTTPException(400,"text is empty")
-    chunks = _chunk_text(text)
-    _add_chunks(source, chunks)
-    return {"source":source,"chunks_added":len(chunks),"total_docs":len(_meta)}
+    text   = payload.get("text", "")
+    source = payload.get("source", "inline-" + str(uuid.uuid4())[:8])
+    if not text.strip():
+        raise HTTPException(400, "text is empty")
+
+    file_id = str(uuid.uuid4())
+    save_path = FILES_DIR / f"{file_id}.txt"
+    save_path.write_text(text, encoding="utf-8")
+    _write_doc_to_kb(file_id, f"{source}.txt", source, text)
+    _filemeta.append({
+        "id": file_id,
+        "filename": f"{source}.txt",
+        "source_name": source,
+        "size": len(text.encode()),
+        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "path": str(save_path),
+        "ext": ".txt",
+    })
+    _save_filemeta()
+
+    import threading
+    threading.Thread(target=_qmd_update_embed, daemon=True).start()
+
+    chunks_written = len(list((KB_DOCS_DIR / file_id).glob("chunk_*.md")))
+    return {"source": source, "chunks_added": chunks_written, "total_docs": len(_filemeta)}
 
 @app.get("/sources")
 def list_sources():
-    from collections import Counter
-    c = Counter(m["source"] for m in _meta)
-    return {"sources":[{"name":k,"chunks":v} for k,v in c.items()]}
+    sources = [{"name": f["source_name"], "filename": f["filename"]} for f in _filemeta]
+    return {"sources": sources}
