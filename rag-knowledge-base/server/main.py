@@ -1276,17 +1276,46 @@ function escHtml(s) {{
 
 
 def _load_copilot_token() -> str | None:
-    """Load GitHub Copilot token from OpenClaw credentials."""
+    """Load GitHub Copilot token, auto-refresh via openclaw if expired."""
+    import time as _time
     token_path = os.path.expanduser("~/.openclaw/credentials/github-copilot.token.json")
+    openclaw_bin = shutil.which("openclaw") or shutil.which("clawd")
+
+    def _read_token():
+        try:
+            with open(token_path) as f:
+                data = json.load(f)
+            token = data.get("token", "")
+            expires_at = data.get("expiresAt", 0) / 1000  # ms → s
+            if token and expires_at > _time.time() + 60:
+                return token
+        except Exception:
+            pass
+        return None
+
+    # First try reading current token
+    token = _read_token()
+    if token:
+        return token
+
+    # Token expired/missing — try refresh via openclaw
+    if openclaw_bin:
+        try:
+            subprocess.run(
+                [openclaw_bin, "auth", "refresh", "--provider", "github-copilot"],
+                capture_output=True, text=True, timeout=30
+            )
+            token = _read_token()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    # Last resort: return token even if expired (let API decide)
     try:
         with open(token_path) as f:
             data = json.load(f)
-        token = data.get("token", "")
-        expires_at = data.get("expiresAt", 0)
-        import time
-        if expires_at and expires_at < time.time() * 1000:
-            return None  # expired
-        return token if token else None
+        return data.get("token") or None
     except Exception:
         return None
 
