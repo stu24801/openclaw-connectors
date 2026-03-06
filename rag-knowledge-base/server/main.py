@@ -694,3 +694,46 @@ def list_sources():
         {"name": f["source_name"], "filename": f["filename"], "category": f.get("category","未分類")}
         for f in _filemeta
     ]}
+
+@app.get("/doc/{file_id}")
+def get_doc_content(file_id: str):
+    """
+    Return full content of a document by file_id.
+    Used by AI to retrieve complete 題目.md or 評分方式.md for grading.
+    """
+    fm = next((f for f in _filemeta if f["id"] == file_id), None)
+    if not fm:
+        raise HTTPException(404, "Document not found")
+    path = Path(fm["path"])
+    if not path.exists():
+        raise HTTPException(404, "File missing on disk")
+    content = path.read_text(encoding="utf-8")
+    return {
+        "id": file_id,
+        "filename": fm["filename"],
+        "source_name": fm["source_name"],
+        "category": fm.get("category", "未分類"),
+        "content": content,
+    }
+
+@app.get("/doc_by_source")
+def get_doc_by_source(source_name: str):
+    """
+    Return full content by source_name (fuzzy: contains match).
+    e.g. GET /doc_by_source?source_name=題目
+    """
+    matches = [f for f in _filemeta if source_name.lower() in f.get("source_name","").lower()]
+    if not matches:
+        raise HTTPException(404, f"No document matching source_name='{source_name}'")
+    results = []
+    for fm in matches:
+        path = Path(fm["path"])
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        results.append({
+            "id": fm["id"],
+            "filename": fm["filename"],
+            "source_name": fm["source_name"],
+            "category": fm.get("category", "未分類"),
+            "content": content,
+        })
+    return {"results": results}
