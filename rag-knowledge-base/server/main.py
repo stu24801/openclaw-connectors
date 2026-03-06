@@ -206,6 +206,7 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
   .topbar h1{{font-size:1.1rem;font-weight:600;color:#a78bfa}}
   .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none}}
   .topbar a:hover{{color:#a78bfa}}
+  .topbar a.active{{color:#a78bfa;border-bottom:2px solid #a78bfa;padding-bottom:2px}}
   .container{{max-width:1100px;margin:40px auto;padding:0 24px}}
   .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:28px;margin-bottom:24px}}
   .card h2{{font-size:1rem;font-weight:600;color:#a78bfa;margin-bottom:18px;display:flex;align-items:center;gap:8px}}
@@ -255,6 +256,7 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
   <h1>🦐 RAG Knowledge Base</h1>
   <a href="/dashboard">Dashboard</a>
   <a href="/search_ui">搜尋</a>
+  <a href="/grade_ui">📝 評分</a>
   <a href="/logout" style="margin-left:auto">登出</a>
 </div>
 <div class="container">
@@ -737,3 +739,398 @@ def get_doc_by_source(source_name: str):
             "content": content,
         })
     return {"results": results}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Grade API — fetch GitHub repo + call OpenClaw for grading
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _github_tree(owner: str, repo: str, branch: str, token: Optional[str]) -> List[dict]:
+    """Fetch recursive file tree from GitHub API."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "rag-kb-grader"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read())
+    return [item for item in data.get("tree", []) if item.get("type") == "blob"]
+
+def _github_file(owner: str, repo: str, branch: str, path: str, token: Optional[str]) -> str:
+    """Fetch raw file content from GitHub."""
+    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+    headers = {"User-Agent": "rag-kb-grader"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+def _parse_github_url(url: str) -> tuple:
+    """Parse GitHub URL → (owner, repo, branch). branch defaults to 'main'."""
+    url = url.strip().rstrip("/")
+    # https://github.com/owner/repo/tree/branch
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)", url)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    # https://github.com/owner/repo
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)", url)
+    if m:
+        return m.group(1), m.group(2), "main"
+    raise ValueError(f"無法解析 GitHub URL: {url}")
+
+PRIORITY_EXTS = {".java", ".kt", ".py", ".ts", ".js", ".go", ".cs", ".sql", ".md", ".xml", ".gradle"}
+PRIORITY_DIRS = {"src", "main", "controller", "service", "entity", "repository", "model", "api", "db"}
+
+def _should_read(path: str) -> bool:
+    ext = Path(path).suffix.lower()
+    if ext not in PRIORITY_EXTS:
+        return False
+    parts = set(Path(path).parts)
+    # Skip test files and build output
+    if any(p in parts for p in {"test", "tests", ".git", "target", "build", "node_modules", "__pycache__"}):
+        return False
+    return True
+
+@app.post("/grade")
+async def grade_api(payload: dict):
+    """
+    Grade a GitHub repo against KB questions and scoring criteria.
+    Body: { "repo_url": "...", "token": "ghp_xxx (optional)" }
+    Returns: { "question": "...", "report": "markdown...", "raw_code_summary": [...] }
+    """
+    repo_url = payload.get("repo_url", "").strip()
+    token    = payload.get("token", "").strip() or None
+    if not repo_url:
+        raise HTTPException(400, "repo_url is required")
+
+    # 1. Parse URL
+    try:
+        owner, repo, branch = _parse_github_url(repo_url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # 2. Get all questions from KB
+    questions = [f for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")]
+    scoring   = [f for f in _filemeta if "評分" in f.get("category","") or "評分" in f.get("source_name","")]
+
+    if not questions:
+        raise HTTPException(404, "知識庫中找不到題目文件，請先上傳題目到分類「新人面試題庫/題目_md」")
+    if not scoring:
+        raise HTTPException(404, "知識庫中找不到評分方式文件，請先上傳評分方式到分類「新人面試題庫/評分方式_md」")
+
+    # 3. Read scoring criteria
+    scoring_content = Path(scoring[0]["path"]).read_text(encoding="utf-8")
+
+    # 4. Get repo file tree
+    try:
+        tree = _github_tree(owner, repo, branch, token)
+    except Exception as e:
+        raise HTTPException(502, f"GitHub API 錯誤：{e}")
+
+    # 5. Read priority files (max 30)
+    code_files = [item["path"] for item in tree if _should_read(item["path"])][:30]
+    code_snippets = []
+    for fpath in code_files:
+        content = _github_file(owner, repo, branch, fpath, token)
+        if content:
+            code_snippets.append({"path": fpath, "content": content[:3000]})
+
+    # 6. Concatenate all questions text
+    questions_text = ""
+    for q in questions:
+        qcontent = Path(q["path"]).read_text(encoding="utf-8")
+        questions_text += f"\n\n---\n## 題目：{q['source_name']}\n{qcontent}"
+
+    # 7. Build prompt for OpenClaw
+    code_summary = "\n\n".join(
+        f"### {s['path']}\n```\n{s['content'][:1500]}\n```"
+        for s in code_snippets[:15]
+    )
+
+    return {
+        "owner": owner,
+        "repo": repo,
+        "branch": branch,
+        "file_count": len(tree),
+        "code_files_read": len(code_snippets),
+        "questions_available": [q["source_name"] for q in questions],
+        "scoring_criteria": scoring_content,
+        "questions_text": questions_text,
+        "code_summary": code_summary,
+        "grading_prompt": f"""你是一位嚴格但公正的後端工程師面試評審。
+
+請根據以下資訊進行評分：
+
+# 考題內容
+{questions_text}
+
+# 評分方式
+{scoring_content}
+
+# 應試者的 GitHub Repo
+- URL: {repo_url}
+- 分支: {branch}
+- 共 {len(tree)} 個檔案，已讀取 {len(code_snippets)} 個主要程式碼檔案
+
+# 程式碼內容
+{code_summary}
+
+---
+
+請完成以下任務：
+
+1. **判定題目**：分析程式碼，確認這份 repo 對應「考題內容」中的哪一道題目，說明判斷依據。
+
+2. **逐項評分**：按照「評分方式」的每個評分項目，逐一評定是否達標，給出分數。
+
+3. **輸出報告**：以下列格式輸出完整評分報告：
+
+```
+# 📋 評分報告
+
+## 基本資訊
+- Repo: {repo_url}
+- 分支: {branch}
+- 評分時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## 🎯 題目判定
+（說明對應哪一題及判斷依據）
+
+## 📊 評分結果
+
+（依評分方式逐項評分）
+
+## 💯 總分
+（統計各項得分）
+
+## 💡 改進建議
+（列出主要缺失與建議）
+```
+""",
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Grade UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/grade_ui", response_class=HTMLResponse)
+def grade_ui(rag_token: Optional[str] = Cookie(None)):
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+
+    # Count available questions
+    question_count = len([f for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")])
+    scoring_count  = len([f for f in _filemeta if "評分" in f.get("category","") or "評分" in f.get("source_name","")])
+    q_list = [f["source_name"] for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")]
+
+    status_color = "#86efac" if question_count > 0 and scoring_count > 0 else "#fca5a5"
+    status_icon  = "✅" if question_count > 0 and scoring_count > 0 else "⚠️"
+    status_msg   = f"{question_count} 道題目、{scoring_count} 份評分方式已載入" if question_count > 0 else "尚未上傳題目或評分方式，請先至 Dashboard 上傳"
+
+    q_badges = "".join(f'<span class="badge badge-blue" style="margin:2px">{q}</span>' for q in q_list)
+
+    body = f"""
+<div class="card">
+  <h2>📝 GitHub 作業自動評分</h2>
+
+  <!-- KB 狀態 -->
+  <div style="background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;margin-bottom:20px;display:flex;align-items:center;gap:12px">
+    <span style="font-size:1.4rem">{status_icon}</span>
+    <div>
+      <div style="font-size:.85rem;color:{status_color}">{status_msg}</div>
+      <div style="margin-top:6px">{q_badges}</div>
+    </div>
+  </div>
+
+  <!-- 輸入表單 -->
+  <div style="margin-bottom:16px">
+    <label>GitHub Repo URL</label>
+    <input type="text" id="repo-url" placeholder="https://github.com/owner/repo/tree/main"
+           style="margin-bottom:12px">
+    <label>GitHub Token（選填，私有 repo 才需要）</label>
+    <input type="text" id="gh-token" placeholder="ghp_xxxxx（選填）">
+  </div>
+
+  <button class="btn" id="grade-btn" onclick="doGrade()">🚀 開始評分</button>
+  <span style="margin-left:12px;font-size:.8rem;color:#64748b">評分約需 30–60 秒</span>
+</div>
+
+<!-- Loading -->
+<div id="loading" style="display:none">
+  <div class="card" style="text-align:center;padding:48px">
+    <div class="spinner" style="margin-bottom:16px"></div>
+    <div style="color:#a78bfa;font-weight:600;margin-bottom:8px">正在分析 Repo 並評分中…</div>
+    <div id="loading-step" style="color:#64748b;font-size:.85rem">讀取題目與評分方式</div>
+  </div>
+</div>
+
+<!-- Result -->
+<div id="result-area" style="display:none">
+  <div class="card">
+    <h2>📊 評分報告</h2>
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <button class="btn btn-sm btn-ghost" onclick="copyReport()">📋 複製報告</button>
+      <button class="btn btn-sm btn-ghost" onclick="downloadReport()">⬇ 下載 .md</button>
+    </div>
+    <div id="report-md" style="display:none"></div>
+    <div id="report-html" style="
+      background:#0f1117;border:1px solid #2d3154;border-radius:8px;
+      padding:20px;font-size:.88rem;line-height:1.7;overflow-x:auto;
+      white-space:pre-wrap;font-family:'Segoe UI',sans-serif;color:#e2e8f0
+    "></div>
+  </div>
+</div>
+
+<!-- Error -->
+<div id="error-area"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+let _reportMd = '';
+
+async function doGrade() {{
+  const repoUrl = document.getElementById('repo-url').value.trim();
+  const token   = document.getElementById('gh-token').value.trim();
+  if (!repoUrl) {{ alert('請輸入 GitHub Repo URL'); return; }}
+
+  document.getElementById('grade-btn').disabled = true;
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('result-area').style.display = 'none';
+  document.getElementById('error-area').innerHTML = '';
+
+  const steps = [
+    '讀取題目與評分方式…',
+    '連接 GitHub API，取得檔案列表…',
+    '讀取程式碼檔案…',
+    'AI 分析中，判定題目…',
+    '逐項評分中…',
+    '產生報告…',
+  ];
+  let si = 0;
+  const stepInterval = setInterval(() => {{
+    if (si < steps.length) {{
+      document.getElementById('loading-step').textContent = steps[si++];
+    }}
+  }}, 8000);
+
+  try {{
+    // Step 1: Get grading context from RAG KB
+    const gradeRes = await fetch('/grade', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ repo_url: repoUrl, token: token || null }}),
+    }});
+    if (!gradeRes.ok) {{
+      const err = await gradeRes.json();
+      throw new Error(err.detail || gradeRes.statusText);
+    }}
+    const gradeData = await gradeRes.json();
+    document.getElementById('loading-step').textContent = 'AI 評分中，請稍候…';
+
+    // Step 2: Call OpenClaw AI with the prompt
+    const aiRes = await fetch('/ai_grade', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ prompt: gradeData.grading_prompt, meta: gradeData }}),
+    }});
+    if (!aiRes.ok) {{
+      const err = await aiRes.json();
+      throw new Error(err.detail || aiRes.statusText);
+    }}
+    const aiData = await aiRes.json();
+    _reportMd = aiData.report;
+
+    clearInterval(stepInterval);
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('result-area').style.display = 'block';
+    document.getElementById('grade-btn').disabled = false;
+    document.getElementById('report-md').textContent = _reportMd;
+    document.getElementById('report-html').innerHTML =
+      typeof marked !== 'undefined' ? marked.parse(_reportMd) : _reportMd;
+
+  }} catch(e) {{
+    clearInterval(stepInterval);
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('grade-btn').disabled = false;
+    document.getElementById('error-area').innerHTML =
+      `<div class="alert alert-error">❌ 評分失敗：${{e.message}}</div>`;
+  }}
+}}
+
+function copyReport() {{
+  navigator.clipboard.writeText(_reportMd).then(() => alert('已複製到剪貼簿！'));
+}}
+
+function downloadReport() {{
+  const blob = new Blob([_reportMd], {{type:'text/markdown'}});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'grading-report.md';
+  a.click();
+}}
+</script>
+"""
+    return HTMLResponse(_base_html(body, "評分 — RAG KB"))
+
+
+@app.post("/ai_grade")
+async def ai_grade(payload: dict):
+    """
+    Call OpenClaw AI to generate grading report.
+    Uses qmd llm or clawdbot to perform AI inference.
+    """
+    prompt = payload.get("prompt", "")
+    if not prompt:
+        raise HTTPException(400, "prompt required")
+
+    # Try clawdbot CLI for AI inference
+    try:
+        result = subprocess.run(
+            ["clawdbot", "--no-stream", "--prompt", prompt],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "HOME": os.path.expanduser("~")},
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return {"report": result.stdout.strip()}
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fallback: try qmd llm
+    try:
+        result = subprocess.run(
+            [QMD_BIN, "llm", prompt],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return {"report": result.stdout.strip()}
+    except Exception:
+        pass
+
+    # Final fallback: return the prompt context with instructions
+    # so the user can paste it to any AI
+    meta = payload.get("meta", {})
+    return {
+        "report": f"""# ⚠️ 自動 AI 評分暫不可用
+
+請將以下評分 Prompt 貼入您慣用的 AI（如 Claude、GPT）進行評分：
+
+---
+
+Repo 資訊：
+- Owner: {meta.get('owner','')}
+- Repo: {meta.get('repo','')}
+- 分支: {meta.get('branch','')}
+- 讀取檔案數: {meta.get('code_files_read', 0)} / {meta.get('file_count', 0)}
+
+可用題目：
+{chr(10).join('- ' + q for q in meta.get('questions_available', []))}
+
+---
+
+評分 Prompt 已準備好，AI 推論服務暫時離線（clawdbot/qmd llm 未回應）。
+請稍後再試，或手動將程式碼貼入 AI 請求評分。
+"""
+    }
