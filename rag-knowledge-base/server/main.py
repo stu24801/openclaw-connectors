@@ -802,7 +802,7 @@ async def grade_api(payload: dict):
     Returns: { "question": "...", "report": "markdown...", "raw_code_summary": [...] }
     """
     repo_url = payload.get("repo_url", "").strip()
-    token    = payload.get("token", "").strip() or None
+    token    = (payload.get("token") or "").strip() or None
     if not repo_url:
         raise HTTPException(400, "repo_url is required")
 
@@ -1048,8 +1048,19 @@ async function doGrade() {{
     document.getElementById('result-area').style.display = 'block';
     document.getElementById('grade-btn').disabled = false;
     document.getElementById('report-md').textContent = _reportMd;
-    document.getElementById('report-html').innerHTML =
-      typeof marked !== 'undefined' ? marked.parse(_reportMd) : _reportMd;
+
+    // If auto=false, show prompt-copy mode; otherwise render markdown
+    if (!aiData.auto) {{
+      document.getElementById('report-html').innerHTML = `
+        <div class="alert" style="background:#1c1a2e;border:1px solid #4b3f72;color:#c4b5fd;margin-bottom:16px">
+          ⚠️ 自動評分服務離線，已產生評分 Prompt，請複製後貼入 Claude / ChatGPT 進行評分。
+        </div>
+        <pre style="white-space:pre-wrap;font-size:.8rem;color:#94a3b8;background:#0a0a0f;
+          padding:16px;border-radius:8px;max-height:500px;overflow-y:auto">${{escHtml(_reportMd)}}</pre>`;
+    }} else {{
+      document.getElementById('report-html').innerHTML =
+        typeof marked !== 'undefined' ? marked.parse(_reportMd) : _reportMd;
+    }}
 
   }} catch(e) {{
     clearInterval(stepInterval);
@@ -1071,6 +1082,10 @@ function downloadReport() {{
   a.download = 'grading-report.md';
   a.click();
 }}
+
+function escHtml(s) {{
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
 </script>
 """
     return HTMLResponse(_base_html(body, "評分 — RAG KB"))
@@ -1079,58 +1094,46 @@ function downloadReport() {{
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
     """
-    Call OpenClaw AI to generate grading report.
-    Uses qmd llm or clawdbot to perform AI inference.
+    Attempt AI grading via openclaw exec, fallback to returning prompt for manual use.
     """
     prompt = payload.get("prompt", "")
+    meta   = payload.get("meta", {})
     if not prompt:
         raise HTTPException(400, "prompt required")
 
-    # Try clawdbot CLI for AI inference
-    try:
-        result = subprocess.run(
-            ["clawdbot", "--no-stream", "--prompt", prompt],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ, "HOME": os.path.expanduser("~")},
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return {"report": result.stdout.strip()}
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    # Try openclaw exec (if available)
+    openclaw_bin = shutil.which("openclaw") or shutil.which("clawd")
+    if openclaw_bin:
+        try:
+            result = subprocess.run(
+                [openclaw_bin, "exec", "--no-stream", prompt],
+                capture_output=True, text=True, timeout=180,
+                env={**os.environ, "HOME": os.path.expanduser("~")},
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return {"report": result.stdout.strip(), "auto": True}
+        except Exception:
+            pass
 
-    # Fallback: try qmd llm
-    try:
-        result = subprocess.run(
-            [QMD_BIN, "llm", prompt],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return {"report": result.stdout.strip()}
-    except Exception:
-        pass
+    # Fallback: return prompt so user can copy to any AI
+    report = f"""# 📋 評分 Prompt 已就緒
 
-    # Final fallback: return the prompt context with instructions
-    # so the user can paste it to any AI
-    meta = payload.get("meta", {})
-    return {
-        "report": f"""# ⚠️ 自動 AI 評分暫不可用
+> **AI 推論服務目前離線**，請將下方 Prompt 複製到 Claude / ChatGPT / 任何 AI 進行評分。
 
-請將以下評分 Prompt 貼入您慣用的 AI（如 Claude、GPT）進行評分：
+## Repo 資訊
+- **Owner / Repo**: {meta.get('owner','')}/{meta.get('repo','')}
+- **分支**: {meta.get('branch','')}
+- **讀取程式碼檔案**: {meta.get('code_files_read', 0)} 個（共 {meta.get('file_count', 0)} 個檔案）
 
----
-
-Repo 資訊：
-- Owner: {meta.get('owner','')}
-- Repo: {meta.get('repo','')}
-- 分支: {meta.get('branch','')}
-- 讀取檔案數: {meta.get('code_files_read', 0)} / {meta.get('file_count', 0)}
-
-可用題目：
+## 可對照的題目
 {chr(10).join('- ' + q for q in meta.get('questions_available', []))}
 
 ---
 
-評分 Prompt 已準備好，AI 推論服務暫時離線（clawdbot/qmd llm 未回應）。
-請稍後再試，或手動將程式碼貼入 AI 請求評分。
+## 📄 完整評分 Prompt（複製以下內容給 AI）
+
+```
+{prompt}
+```
 """
-    }
+    return {"report": report, "auto": False}
