@@ -1144,6 +1144,13 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
       </button>
     </div>
     <div style="font-size:.75rem;color:#475569;margin-top:6px">Enter 送出 ｜ Shift+Enter 換行</div>
+    <hr style="border-color:#2d3154;margin:16px 0">
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn btn-ghost" id="regen-btn" onclick="regenReport()" style="white-space:nowrap">
+        🔄 根據討論重新產製評分報告
+      </button>
+      <span style="font-size:.78rem;color:#64748b">將對話內容納入考量，產製修正版報告並更新上方報告區</span>
+    </div>
   </div>
 </div>
 
@@ -1362,6 +1369,42 @@ async function sendChat() {{
   document.getElementById('chat-send-btn').disabled = false;
   document.getElementById('chat-input').focus();
 }}
+
+async function regenReport() {{
+  if (!_reportMd || _chatHistory.length === 0) {{
+    alert('請先進行至少一輪對話，再重新產製報告');
+    return;
+  }}
+  const btn = document.getElementById('regen-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 重新產製中…';
+  appendChatMsg('assistant', '🔄 正在根據討論內容重新產製評分報告，請稍候…');
+
+  try {{
+    const resp = await fetch('/regen_report', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        original_report: _reportMd,
+        history: _chatHistory
+      }})
+    }});
+    const data = await resp.json();
+    if (data.report) {{
+      _reportMd = data.report;
+      document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
+      document.getElementById('report-card').style.display = 'block';
+      document.getElementById('report-card').scrollIntoView({{behavior:'smooth', block:'start'}});
+      appendChatMsg('assistant', '✅ 修正版評分報告已更新！請向上查看更新後的報告。');
+    }} else {{
+      appendChatMsg('assistant', '❌ 重新產製失敗：' + escHtml(data.error || '未知錯誤'));
+    }}
+  }} catch(e) {{
+    appendChatMsg('assistant', '❌ 連線失敗：' + String(e));
+  }}
+  btn.disabled = false;
+  btn.textContent = '🔄 根據討論重新產製評分報告';
+}}
 </script>
 """
     return HTMLResponse(_base_html(body, "評分 — RAG KB"))
@@ -1511,3 +1554,65 @@ async def chat_with_report(payload: dict):
         return {"reply": reply}
     except Exception as e:
         raise HTTPException(500, f"LLM 呼叫失敗：{e}")
+
+
+@app.post("/regen_report")
+async def regen_report(payload: dict):
+    """Re-generate grading report incorporating chat discussion."""
+    import httpx
+    original_report = payload.get("original_report", "")
+    history         = payload.get("history", [])  # [{role, content}, ...]
+
+    if not original_report:
+        raise HTTPException(400, "original_report required")
+    if not history:
+        raise HTTPException(400, "history required")
+
+    token = _load_copilot_token()
+    if not token:
+        raise HTTPException(503, "GitHub Copilot token not available")
+
+    # Build conversation summary for context
+    chat_summary = "\n".join(
+        f"{'【評分者】' if h['role']=='assistant' else '【老師】'}{h['content']}"
+        for h in history[-20:]  # last 20 turns
+        if h.get("content")
+    )
+
+    regen_prompt = (
+        "你是一位專業的作業評分助理。以下是原始的 AI 評分報告，以及評分者與老師之間的討論對話。\n"
+        "請根據討論內容，重新產製一份修正版的評分報告。\n"
+        "要求：\n"
+        "1. 保留原始報告的結構和格式（Markdown）\n"
+        "2. 根據討論中提到的修正意見調整分數和評語\n"
+        "3. 在報告開頭加上「**📝 修正版（依討論更新）**」標記\n"
+        "4. 若某題有爭議，請在評語中說明修正原因\n"
+        "5. 回應語言使用繁體中文\n\n"
+        f"## 原始評分報告\n\n{original_report}\n\n"
+        f"## 討論對話記錄\n\n{chat_summary}\n\n"
+        "請現在產製修正版評分報告："
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": "vscode/1.95.0",
+    }
+    body = {
+        "model": "claude-sonnet-4.6",
+        "messages": [{"role": "user", "content": regen_prompt}],
+        "max_tokens": 4096,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.post(
+                "https://api.githubcopilot.com/chat/completions",
+                headers=headers, json=body
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            report = data["choices"][0]["message"]["content"]
+        return {"report": report}
+    except Exception as e:
+        return {"error": str(e)}
