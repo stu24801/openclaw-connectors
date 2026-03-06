@@ -1,6 +1,6 @@
 """
 RAG Knowledge Base Server — QMD SQLite direct + embed_server (port 8766)
-Bypasses qmd vsearch CLI (too slow on CPU); uses sqlite-vec directly.
+v2: 支援分層分類 (category) 管理與搜尋過濾
 """
 
 import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, struct, urllib.request
@@ -24,7 +24,7 @@ QMD_COLL      = "rag-kb"
 TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
 PASSWORD      = os.getenv("RAG_PASSWORD", "changeme")
 
-# ── In-memory session store ────────────────────────────────────────────────────
+# ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
 
 app = FastAPI(title="RAG Knowledge Base")
@@ -39,10 +39,24 @@ def _load_filemeta():
 def _save_filemeta():
     FILEMETA_PATH.write_text(json.dumps(_filemeta, ensure_ascii=False, indent=2))
 
+def _all_categories() -> List[str]:
+    """Return sorted unique category paths from filemeta."""
+    cats = sorted({f.get("category", "未分類") for f in _filemeta})
+    return cats
+
+def _category_tree() -> dict:
+    """Build nested dict from category paths for sidebar tree view."""
+    tree = {}
+    for cat in _all_categories():
+        parts = cat.split("/")
+        node = tree
+        for p in parts:
+            node = node.setdefault(p, {})
+    return tree
+
 # ── Embedding (via embed_server on port 8766) ─────────────────────────────────
 
 def _get_embedding(text: str) -> Optional[bytes]:
-    """Call embed_server, return raw float32 bytes for sqlite-vec."""
     try:
         req = urllib.request.Request(
             EMBED_URL,
@@ -52,19 +66,30 @@ def _get_embedding(text: str) -> Optional[bytes]:
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
-        vec = data["embedding"]          # list of 768 floats
-        return struct.pack(f"{len(vec)}f", *vec)   # raw bytes for sqlite-vec
+        vec = data["embedding"]
+        return struct.pack(f"{len(vec)}f", *vec)
     except Exception as e:
         print(f"[embed] error: {e}")
         return None
 
 # ── SQLite vector search ──────────────────────────────────────────────────────
 
-def _sqlite_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
-    """Direct sqlite-vec cosine search on QMD index, rag-kb collection only."""
+def _sqlite_vsearch(query: str, top_k: int = TOP_K, category: Optional[str] = None) -> List[dict]:
+    """Cosine search + optional category filter (prefix match)."""
     vec_bytes = _get_embedding(query)
     if vec_bytes is None:
         return []
+
+    # Build set of file paths that belong to the requested category (prefix)
+    if category:
+        allowed_files = {
+            Path(f["path"]).name
+            for f in _filemeta
+            if f.get("category", "未分類").startswith(category)
+        }
+    else:
+        allowed_files = None
+
     try:
         db = sqlite3.connect(QMD_DB_PATH)
         db.enable_load_extension(True)
@@ -85,16 +110,22 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
               AND vv.embedding MATCH ?
               AND k = ?
             ORDER BY score DESC
-        """, (QMD_COLL, vec_bytes, top_k * 3)).fetchall()
+        """, (QMD_COLL, vec_bytes, top_k * 5)).fetchall()
         db.close()
+
+        # Build file_id → metadata map for category lookup
+        path_to_meta = {Path(f["path"]).name: f for f in _filemeta}
 
         results = []
         seen_hashes = set()
         for title, fpath, chash, pos, score in rows:
             if chash in seen_hashes:
                 continue
+            fname = Path(fpath).name
+            if allowed_files is not None and fname not in allowed_files:
+                continue
             seen_hashes.add(chash)
-            # Read snippet from content table
+
             db2 = sqlite3.connect(QMD_DB_PATH)
             content_row = db2.execute("SELECT doc FROM content WHERE hash=?", (chash,)).fetchone()
             db2.close()
@@ -102,9 +133,12 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
             if content_row:
                 full = content_row[0]
                 body = full[pos:pos+400] if pos < len(full) else full[:400]
+
+            fm = path_to_meta.get(fname, {})
             results.append({
                 "score": round(score, 4),
-                "title": title,
+                "title": fm.get("source_name", title),
+                "category": fm.get("category", "未分類"),
                 "file": fpath,
                 "body": body,
             })
@@ -115,7 +149,7 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
         print(f"[sqlite_vsearch] error: {e}")
         return []
 
-# ── QMD update+embed (background, for new uploads) ───────────────────────────
+# ── QMD update+embed (background) ────────────────────────────────────────────
 
 def _qmd_update_embed():
     try:
@@ -137,7 +171,29 @@ def startup():
 #  HTML helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _base_html(body: str, title="RAG Knowledge Base") -> str:
+def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = None) -> str:
+    # Build sidebar category links
+    sidebar_html = ""
+    if sidebar_cats is not None:
+        links = '<a href="/dashboard" style="color:#94a3b8;text-decoration:none;display:block;padding:6px 8px;border-radius:6px;font-size:.82rem">📋 全部文件</a>'
+        for cat in sidebar_cats:
+            depth = cat.count("/")
+            indent = depth * 14
+            label = cat.split("/")[-1]
+            links += f'<a href="/dashboard?cat={cat}" style="color:#94a3b8;text-decoration:none;display:block;padding:5px 8px 5px {8+indent}px;border-radius:6px;font-size:.82rem">{"  " * depth}📁 {label}</a>'
+        sidebar_html = f"""
+<div style="width:200px;flex-shrink:0">
+  <div style="background:#1a1d2e;border:1px solid #2d3154;border-radius:10px;padding:14px">
+    <div style="color:#64748b;font-size:.75rem;font-weight:600;margin-bottom:10px;letter-spacing:.05em">分類</div>
+    {links}
+  </div>
+</div>"""
+
+    layout_start = '<div style="display:flex;gap:24px;align-items:flex-start">' if sidebar_cats is not None else ""
+    layout_end   = "</div>" if sidebar_cats is not None else ""
+    content_wrap_start = '<div style="flex:1;min-width:0">' if sidebar_cats is not None else ""
+    content_wrap_end   = "</div>" if sidebar_cats is not None else ""
+
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -148,18 +204,18 @@ def _base_html(body: str, title="RAG Knowledge Base") -> str:
   body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
   .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:14px 32px;display:flex;align-items:center;gap:16px}}
   .topbar h1{{font-size:1.1rem;font-weight:600;color:#a78bfa}}
-  .topbar span{{font-size:.8rem;color:#64748b;margin-left:auto}}
   .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none}}
   .topbar a:hover{{color:#a78bfa}}
-  .container{{max-width:860px;margin:40px auto;padding:0 24px}}
+  .container{{max-width:1100px;margin:40px auto;padding:0 24px}}
   .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:28px;margin-bottom:24px}}
   .card h2{{font-size:1rem;font-weight:600;color:#a78bfa;margin-bottom:18px;display:flex;align-items:center;gap:8px}}
   label{{font-size:.85rem;color:#94a3b8;display:block;margin-bottom:6px}}
-  input[type=text],input[type=password],input[type=file]{{
+  input[type=text],input[type=password],input[type=file],select{{
     width:100%;padding:10px 14px;background:#0f1117;border:1px solid #2d3154;
     border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;transition:.2s
   }}
-  input:focus{{border-color:#a78bfa}}
+  select option{{background:#1a1d2e}}
+  input:focus,select:focus{{border-color:#a78bfa}}
   .btn{{display:inline-block;padding:10px 22px;background:#7c3aed;color:#fff;
     border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s}}
   .btn:hover{{background:#6d28d9}}
@@ -177,6 +233,8 @@ def _base_html(body: str, title="RAG Knowledge Base") -> str:
   tr:hover td{{background:#1e2235}}
   .badge{{display:inline-block;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:500}}
   .badge-purple{{background:#3b0764;color:#c4b5fd}}
+  .badge-blue{{background:#1e3a5f;color:#93c5fd}}
+  .badge-green{{background:#052e16;color:#86efac}}
   .empty{{color:#4b5563;text-align:center;padding:32px;font-size:.9rem}}
   .form-row{{display:flex;gap:12px;align-items:flex-end}}
   .form-row>*{{flex:1}}
@@ -185,44 +243,52 @@ def _base_html(body: str, title="RAG Knowledge Base") -> str:
     border:1px solid #2d3154;border-radius:8px;padding:8px 16px;font-size:.85rem}}
   .stat-val{{font-size:1.2rem;font-weight:700;color:#a78bfa}}
   .stats{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}}
+  .cat-group-header{{background:#13162a;padding:8px 12px;font-size:.78rem;
+    color:#a78bfa;font-weight:600;letter-spacing:.04em;border-bottom:1px solid #2d3154}}
+  @keyframes spin{{ to{{transform:rotate(360deg)}} }}
+  .spinner{{width:40px;height:40px;margin:0 auto;border:3px solid #2d3154;
+    border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite}}
 </style>
 </head>
 <body>
 <div class="topbar">
   <h1>🦐 RAG Knowledge Base</h1>
-  <a href="/slides/" target="_blank" style="margin-left:auto;background:#3b0764;color:#c4b5fd;padding:6px 14px;border-radius:8px;font-size:.82rem;font-weight:500;border:1px solid #6d28d9">🍌 Banana Slides</a>
-  <a href="/logout">登出</a>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/search_ui">搜尋</a>
+  <a href="/logout" style="margin-left:auto">登出</a>
 </div>
-<div class="container">{body}</div>
+<div class="container">
+  {layout_start}
+  {sidebar_html}
+  {content_wrap_start}
+  {body}
+  {content_wrap_end}
+  {layout_end}
+</div>
 </body>
 </html>"""
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Auth routes
+#  Auth
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
 def root(rag_token: Optional[str] = Cookie(None)):
-    if _auth(rag_token):
-        return RedirectResponse("/dashboard")
-    return RedirectResponse("/login")
+    return RedirectResponse("/dashboard" if _auth(rag_token) else "/login")
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str = ""):
-    err_html = f'<div class="alert alert-error">密碼錯誤，請再試一次。</div>' if error else ""
+    err = '<div class="alert alert-error">密碼錯誤，請再試一次。</div>' if error else ""
     body = f"""
 <div style="max-width:400px;margin:80px auto">
 <div class="card">
-  <h2>🔐 登入</h2>
-  {err_html}
+  <h2>🔐 登入</h2>{err}
   <form method="post" action="/login">
     <label>存取密碼</label>
     <input type="password" name="password" autofocus style="margin-bottom:16px">
     <button class="btn" type="submit" style="width:100%">確認登入</button>
   </form>
-</div>
-</div>"""
+</div></div>"""
     return HTMLResponse(_base_html(body, "登入 — RAG KB"))
 
 @app.post("/login")
@@ -242,73 +308,96 @@ def logout(rag_token: Optional[str] = Cookie(None)):
     resp.delete_cookie("rag_token")
     return resp
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
+def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = "", cat: str = ""):
     if not _auth(rag_token):
         return RedirectResponse("/login")
 
-    doc_count   = len(_filemeta)
-    chunk_count = len(_filemeta)
+    cats = _all_categories()
     ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
 
-    if _filemeta:
-        rows = ""
-        for f in reversed(_filemeta):
-            size_kb = f.get("size", 0) // 1024
-            rows += f"""<tr>
-  <td>{f['filename']}</td>
+    # Filter files by category if requested
+    if cat:
+        display_files = [f for f in _filemeta if f.get("category", "未分類").startswith(cat)]
+        cat_title = f' — 📁 {cat}'
+    else:
+        display_files = _filemeta
+        cat_title = ""
+
+    doc_count = len(display_files)
+
+    # Build existing categories for datalist
+    cat_options = "\n".join(f'<option value="{c}">' for c in cats)
+
+    # Group files by category
+    from collections import defaultdict
+    grouped: dict = defaultdict(list)
+    for f in reversed(display_files):
+        grouped[f.get("category", "未分類")].append(f)
+
+    if display_files:
+        table_parts = []
+        for group_cat in sorted(grouped.keys()):
+            table_parts.append(f'<tr><td colspan="5" class="cat-group-header">📁 {group_cat}</td></tr>')
+            for f in grouped[group_cat]:
+                size_kb = f.get("size", 0) // 1024
+                table_parts.append(f"""<tr>
+  <td style="padding-left:20px">{f['filename']}</td>
   <td><span class="badge badge-purple">{f.get('source_name','—')}</span></td>
-  <td>{size_kb} KB</td>
-  <td style="color:#64748b">{f.get('uploaded_at','')}</td>
+  <td><span class="badge badge-blue">{f.get('category','未分類')}</span></td>
+  <td style="color:#64748b">{f.get('uploaded_at','')}&nbsp;&nbsp;{size_kb} KB</td>
   <td>
-    <a href="/download/{f['id']}" class="btn btn-sm btn-ghost">⬇ 下載</a>
+    <a href="/download/{f['id']}" class="btn btn-sm btn-ghost">⬇</a>
     &nbsp;
     <form method="post" action="/delete/{f['id']}" style="display:inline"
           onsubmit="return confirm('確定刪除？')">
       <button class="btn btn-sm btn-danger">🗑</button>
     </form>
   </td>
-</tr>"""
+</tr>""")
         file_table = f"""<table>
-<thead><tr><th>檔名</th><th>來源標籤</th><th>大小</th><th>上傳時間</th><th>操作</th></tr></thead>
-<tbody>{rows}</tbody></table>"""
+<thead><tr><th>檔名</th><th>標籤</th><th>分類</th><th>時間 / 大小</th><th>操作</th></tr></thead>
+<tbody>{"".join(table_parts)}</tbody></table>"""
     else:
-        file_table = '<div class="empty">尚未上傳任何文件</div>'
+        file_table = '<div class="empty">此分類下尚無文件</div>'
 
     body = f"""
 {ok_html}
 <div class="stats">
-  <div class="stat"><span class="stat-val">{doc_count}</span> 份文件</div>
-  <div class="stat"><span class="stat-val">{chunk_count}</span> 個段落</div>
+  <div class="stat"><span class="stat-val">{doc_count}</span> 份文件{cat_title}</div>
+  <div class="stat"><span class="stat-val">{len(cats)}</span> 個分類</div>
 </div>
 
 <div class="card">
   <h2>📤 上傳文件</h2>
   <form method="post" action="/upload_form" enctype="multipart/form-data" onsubmit="showUploadLoading(this)">
-    <div class="form-row" style="margin-bottom:14px">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">
       <div>
         <label>選擇檔案（.txt / .md / .pdf）</label>
         <input type="file" name="file" accept=".txt,.md,.pdf" required>
       </div>
       <div>
-        <label>來源標籤（選填）</label>
-        <input type="text" name="source_name" placeholder="e.g. 產品手冊">
+        <label>標籤名稱（選填）</label>
+        <input type="text" name="source_name" placeholder="e.g. 玉山銀行規格書">
+      </div>
+      <div>
+        <label>分類路徑（可用 / 分層）</label>
+        <input type="text" name="category" placeholder="e.g. 技術文件/Java" list="cat-list" value="{cat}">
+        <datalist id="cat-list">{cat_options}</datalist>
       </div>
     </div>
     <button class="btn" id="upload-btn" type="submit">上傳並向量化</button>
     <span id="upload-loading" style="display:none;margin-left:14px;color:#94a3b8;font-size:.85rem">
       <span style="display:inline-block;width:14px;height:14px;border:2px solid #4b5563;border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:6px"></span>
-      上傳中，請稍候…
+      上傳中，請稍候…（向量化約需 15 秒）
     </span>
   </form>
-<style>@keyframes spin {{ to {{ transform:rotate(360deg) }} }}</style>
 <script>
-function showUploadLoading(form) {{
+function showUploadLoading() {{
   document.getElementById('upload-btn').disabled = true;
   document.getElementById('upload-loading').style.display = 'inline';
 }}
@@ -316,25 +405,37 @@ function showUploadLoading(form) {{
 </div>
 
 <div class="card">
-  <h2>📋 文件列表</h2>
+  <h2>📋 文件列表{cat_title}</h2>
   {file_table}
 </div>
 
 <div class="card">
   <h2>🔍 快速搜尋</h2>
-  <form method="get" action="/search_ui">
-    <div class="form-row">
-      <input type="text" name="q" placeholder="輸入查詢關鍵字…" required>
-      <button class="btn" type="submit">搜尋</button>
-    </div>
-  </form>
+  <div class="form-row">
+    <input type="text" id="qs-input" placeholder="輸入查詢關鍵字…"
+           onkeydown="if(event.key==='Enter')goSearch()">
+    <select id="qs-cat">
+      <option value="">全部分類</option>
+      {"".join(f'<option value="{c}">{c}</option>' for c in cats)}
+    </select>
+    <button class="btn" onclick="goSearch()">搜尋</button>
+  </div>
+<script>
+function goSearch() {{
+  const q = document.getElementById('qs-input').value.trim();
+  const c = document.getElementById('qs-cat').value;
+  if (!q) return;
+  let url = '/search_ui?q=' + encodeURIComponent(q);
+  if (c) url += '&category=' + encodeURIComponent(c);
+  window.location.href = url;
+}}
+</script>
 </div>
 """
-    return HTMLResponse(_base_html(body))
-
+    return HTMLResponse(_base_html(body, "Dashboard — RAG KB", sidebar_cats=cats))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Upload (form)
+#  Upload
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upload_form")
@@ -342,21 +443,20 @@ async def upload_form(
     rag_token: Optional[str] = Cookie(None),
     file: UploadFile = File(...),
     source_name: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
 ):
     if not _auth(rag_token):
         return RedirectResponse("/login")
 
     raw = await file.read()
     name = source_name.strip() if source_name and source_name.strip() else (file.filename or "unnamed")
+    cat  = (category.strip().strip("/") if category and category.strip() else "未分類")
 
     if file.filename and file.filename.lower().endswith(".pdf"):
         try:
             import pdfplumber
-            text_parts = []
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                for page in pdf.pages:
-                    text_parts.append(page.extract_text() or "")
-            text = "\n".join(text_parts)
+                text = "\n".join(p.extract_text() or "" for p in pdf.pages)
         except ImportError:
             return RedirectResponse("/dashboard?msg=PDF+支援需安裝+pdfplumber", status_code=303)
     else:
@@ -364,7 +464,6 @@ async def upload_form(
 
     file_id  = str(uuid.uuid4())
     save_ext = Path(file.filename).suffix if file.filename else ".txt"
-    # Always save as .txt or .md so QMD collection can index it
     if save_ext.lower() not in ('.txt', '.md'):
         save_ext = '.txt'
     save_path = FILES_DIR / f"{file_id}{save_ext}"
@@ -374,6 +473,7 @@ async def upload_form(
         "id": file_id,
         "filename": file.filename or "unnamed",
         "source_name": name,
+        "category": cat,
         "size": len(raw),
         "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
@@ -381,15 +481,16 @@ async def upload_form(
     })
     _save_filemeta()
 
-    # Update QMD index in background
     import threading
     threading.Thread(target=_qmd_update_embed, daemon=True).start()
 
-    return RedirectResponse(f"/dashboard?msg=上傳成功：{file.filename}（{len(text)}字）已排入向量化", status_code=303)
-
+    return RedirectResponse(
+        f"/dashboard?msg=上傳成功：{file.filename}（分類：{cat}）已排入向量化&cat={cat}",
+        status_code=303
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Download
+#  Download / Delete
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/download/{file_id}")
@@ -398,16 +499,11 @@ def download(file_id: str, rag_token: Optional[str] = Cookie(None)):
         return RedirectResponse("/login")
     fm = next((f for f in _filemeta if f["id"] == file_id), None)
     if not fm:
-        raise HTTPException(404, "File not found")
+        raise HTTPException(404)
     path = Path(fm["path"])
     if not path.exists():
         raise HTTPException(404, "File missing on disk")
     return FileResponse(str(path), filename=fm["filename"])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Delete
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/delete/{file_id}")
 def delete_file(file_id: str, rag_token: Optional[str] = Cookie(None)):
@@ -416,80 +512,80 @@ def delete_file(file_id: str, rag_token: Optional[str] = Cookie(None)):
         return RedirectResponse("/login")
     fm = next((f for f in _filemeta if f["id"] == file_id), None)
     if not fm:
-        raise HTTPException(404, "File not found")
-
+        raise HTTPException(404)
     p = Path(fm["path"])
     if p.exists():
         p.unlink()
-
     _filemeta = [f for f in _filemeta if f["id"] != file_id]
     _save_filemeta()
-
     import threading
     threading.Thread(target=_qmd_update_embed, daemon=True).start()
-
     return RedirectResponse(f"/dashboard?msg=已刪除：{fm['filename']}", status_code=303)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Search UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/search_ui", response_class=HTMLResponse)
-def search_ui(q: str = "", rag_token: Optional[str] = Cookie(None)):
+def search_ui(q: str = "", category: str = "", rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
+
+    cats = _all_categories()
+    cat_options = "\n".join(
+        f'<option value="{c}" {"selected" if c==category else ""}>{c}</option>'
+        for c in cats
+    )
 
     body = f"""
 <div class="card">
   <h2>🔍 語意搜尋</h2>
-  <div class="form-row" style="margin-bottom:20px">
-    <input type="text" id="search-input" value="{q}" placeholder="輸入查詢關鍵字…" autofocus
-           onkeydown="if(event.key==='Enter')doSearch()">
-    <button class="btn" id="search-btn" onclick="doSearch()">搜尋</button>
-    <a href="/dashboard" class="btn btn-ghost">← 返回</a>
+  <div style="display:grid;grid-template-columns:1fr auto auto;gap:12px;margin-bottom:20px;align-items:end">
+    <div>
+      <label>查詢關鍵字</label>
+      <input type="text" id="search-input" value="{q}" placeholder="輸入查詢關鍵字…" autofocus
+             onkeydown="if(event.key==='Enter')doSearch()">
+    </div>
+    <div>
+      <label>分類過濾</label>
+      <select id="search-cat" style="width:180px">
+        <option value="">全部分類</option>
+        {cat_options}
+      </select>
+    </div>
+    <div>
+      <button class="btn" id="search-btn" onclick="doSearch()">搜尋</button>
+    </div>
   </div>
 
-  <!-- Loading spinner -->
   <div id="loading" style="display:none;text-align:center;padding:40px">
     <div class="spinner"></div>
     <div style="color:#94a3b8;font-size:.85rem;margin-top:14px">向量搜尋中，請稍候…<br>
       <span style="font-size:.75rem;color:#4b5563">（首次查詢需要 10–30 秒載入模型）</span>
     </div>
   </div>
-
-  <!-- Results area -->
   <div id="results"></div>
 </div>
 
-<style>
-.spinner {{
-  width:40px;height:40px;margin:0 auto;
-  border:3px solid #2d3154;
-  border-top-color:#a78bfa;
-  border-radius:50%;
-  animation:spin 0.8s linear infinite;
-}}
-@keyframes spin {{ to {{ transform:rotate(360deg) }} }}
-</style>
-
 <script>
-const initialQ = {json.dumps(q)};
+const initialQ   = {json.dumps(q)};
+const initialCat = {json.dumps(category)};
 
 async function doSearch() {{
-  const q = document.getElementById('search-input').value.trim();
+  const q   = document.getElementById('search-input').value.trim();
+  const cat = document.getElementById('search-cat').value;
   if (!q) return;
 
-  // Update URL without reload
-  history.replaceState(null, '', '/search_ui?q=' + encodeURIComponent(q));
+  let qs = '?q=' + encodeURIComponent(q);
+  if (cat) qs += '&category=' + encodeURIComponent(cat);
+  history.replaceState(null, '', '/search_ui' + qs);
 
-  // Show loading, hide results
   document.getElementById('loading').style.display = 'block';
   document.getElementById('results').innerHTML = '';
   document.getElementById('search-btn').disabled = true;
 
   try {{
-    const res = await fetch('/search?q=' + encodeURIComponent(q) + '&top_k=5');
+    const res  = await fetch('/search' + qs + '&top_k=5');
     const data = await res.json();
 
     document.getElementById('loading').style.display = 'none';
@@ -503,19 +599,21 @@ async function doSearch() {{
 
     let rows = '';
     for (const r of data.results) {{
-      const score = (r.score || 0).toFixed(3);
-      const source = r.title || r.file || '—';
-      const body = (r.body || r.snippet || '').substring(0, 300)
+      const score  = (r.score || 0).toFixed(3);
+      const source = r.title || '—';
+      const cat    = r.category || '—';
+      const body   = (r.body || '').substring(0, 300)
         .replace(/</g,'&lt;').replace(/>/g,'&gt;');
       rows += `<tr>
         <td style="color:#a78bfa;font-weight:600">${{score}}</td>
         <td><span class="badge badge-purple">${{source}}</span></td>
+        <td><span class="badge badge-blue">${{cat}}</span></td>
         <td style="white-space:pre-wrap;font-size:.8rem;color:#cbd5e1">${{body}}…</td>
       </tr>`;
     }}
     document.getElementById('results').innerHTML = `
       <table>
-        <thead><tr><th>相關度</th><th>來源</th><th>內容片段</th></tr></thead>
+        <thead><tr><th>相關度</th><th>來源</th><th>分類</th><th>內容片段</th></tr></thead>
         <tbody>${{rows}}</tbody>
       </table>`;
   }} catch(e) {{
@@ -526,57 +624,73 @@ async function doSearch() {{
   }}
 }}
 
-// Auto-search if query param is set
 if (initialQ) doSearch();
 </script>
 """
-    return HTMLResponse(_base_html(body, "搜尋 — RAG KB"))
-
+    return HTMLResponse(_base_html(body, "搜尋 — RAG KB", sidebar_cats=cats))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  JSON API (for AI use)
+#  JSON API
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    doc_count = len(_filemeta)
-    return {"status": "ok", "backend": "qmd+sqlite-vec", "doc_count": doc_count}
+    return {
+        "status": "ok",
+        "backend": "qmd+sqlite-vec",
+        "doc_count": len(_filemeta),
+        "categories": _all_categories(),
+    }
+
+@app.get("/categories")
+def list_categories():
+    """List all categories and document counts per category."""
+    from collections import Counter
+    counts = Counter(f.get("category", "未分類") for f in _filemeta)
+    return {"categories": [{"name": k, "count": v} for k, v in sorted(counts.items())]}
 
 @app.get("/search")
-def search_api(q: str, top_k: int = TOP_K, source: Optional[str] = None):
-    results = _sqlite_vsearch(q, top_k)
+def search_api(q: str, top_k: int = TOP_K, category: Optional[str] = None, source: Optional[str] = None):
+    """
+    Vector search API.
+    ?q=query             — search query (required)
+    &category=技術文件    — filter by category prefix (optional)
+    &top_k=5             — number of results (optional)
+    """
+    results = _sqlite_vsearch(q, top_k, category=category)
     if source:
         results = [r for r in results if source.lower() in (r.get("title","") + r.get("file","")).lower()]
-    return {"query": q, "results": results[:top_k]}
+    return {"query": q, "category_filter": category, "results": results[:top_k]}
 
 @app.post("/upload_text")
 async def upload_text_api(payload: dict):
-    text   = payload.get("text", "")
-    source = payload.get("source", "inline-" + str(uuid.uuid4())[:8])
+    text     = payload.get("text", "")
+    source   = payload.get("source", "inline-" + str(uuid.uuid4())[:8])
+    category = (payload.get("category", "未分類") or "未分類").strip().strip("/")
     if not text.strip():
         raise HTTPException(400, "text is empty")
 
-    file_id = str(uuid.uuid4())
+    file_id   = str(uuid.uuid4())
     save_path = FILES_DIR / f"{file_id}.txt"
     save_path.write_text(text, encoding="utf-8")
     _filemeta.append({
         "id": file_id,
         "filename": f"{source}.txt",
         "source_name": source,
+        "category": category,
         "size": len(text.encode()),
         "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
         "ext": ".txt",
     })
     _save_filemeta()
-
     import threading
     threading.Thread(target=_qmd_update_embed, daemon=True).start()
-
-    chunks_written = 1
-    return {"source": source, "chunks_added": chunks_written, "total_docs": len(_filemeta)}
+    return {"source": source, "category": category, "total_docs": len(_filemeta)}
 
 @app.get("/sources")
 def list_sources():
-    sources = [{"name": f["source_name"], "filename": f["filename"]} for f in _filemeta]
-    return {"sources": sources}
+    return {"sources": [
+        {"name": f["source_name"], "filename": f["filename"], "category": f.get("category","未分類")}
+        for f in _filemeta
+    ]}
