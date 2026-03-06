@@ -1,24 +1,25 @@
 """
-RAG Knowledge Base Server — QMD-backed (sqlite-vec + GGUF embeddings)
-No sentence-transformers or faiss required.
+RAG Knowledge Base Server — QMD SQLite direct + embed_server (port 8766)
+Bypasses qmd vsearch CLI (too slow on CPU); uses sqlite-vec directly.
 """
 
-import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re
+import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, struct, urllib.request
 from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Cookie, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-import numpy as np
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
 FILES_DIR     = DATA_DIR / "files"
-KB_DOCS_DIR   = DATA_DIR / "kb_docs"          # QMD collection dir (markdown files)
 FILEMETA_PATH = DATA_DIR / "filemeta.json"
-QMD_BIN       = os.getenv("QMD_BIN", "qmd")   # path to qmd CLI
+QMD_BIN       = os.getenv("QMD_BIN", "qmd")
+QMD_DB_PATH   = os.path.expanduser(os.getenv("QMD_DB", "~/.cache/qmd/index.sqlite"))
+VEC0_SO       = os.path.expanduser(os.getenv("VEC0_SO",
+    "~/.npm-global/lib/node_modules/@tobilu/qmd/node_modules/sqlite-vec-linux-x64/vec0.so"))
+EMBED_URL     = os.getenv("EMBED_URL", "http://127.0.0.1:8766/embed")
 QMD_COLL      = "rag-kb"
 TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
 PASSWORD      = os.getenv("RAG_PASSWORD", "changeme")
@@ -38,56 +39,90 @@ def _load_filemeta():
 def _save_filemeta():
     FILEMETA_PATH.write_text(json.dumps(_filemeta, ensure_ascii=False, indent=2))
 
-# ── QMD helpers ───────────────────────────────────────────────────────────────
+# ── Embedding (via embed_server on port 8766) ─────────────────────────────────
 
-def _qmd_update_embed():
-    """Re-index and embed the rag-kb collection (best-effort, background ok)."""
+def _get_embedding(text: str) -> Optional[bytes]:
+    """Call embed_server, return raw float32 bytes for sqlite-vec."""
     try:
-        subprocess.run([QMD_BIN, "update"], capture_output=True, timeout=120)
-        subprocess.run([QMD_BIN, "embed", "-f"], capture_output=True, timeout=300)
-    except Exception as e:
-        print(f"[qmd embed] warning: {e}")
-
-def _qmd_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
-    """Run qmd vsearch --json and return list of results."""
-    try:
-        result = subprocess.run(
-            [QMD_BIN, "vsearch", query, "--json", "-n", str(top_k * 3), f"qmd://{QMD_COLL}/"],
-            capture_output=True, text=True, timeout=60,
+        req = urllib.request.Request(
+            EMBED_URL,
+            data=json.dumps({"text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        data = json.loads(result.stdout.strip())
-        return data if isinstance(data, list) else []
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        vec = data["embedding"]          # list of 768 floats
+        return struct.pack(f"{len(vec)}f", *vec)   # raw bytes for sqlite-vec
     except Exception as e:
-        print(f"[qmd vsearch] error: {e}")
+        print(f"[embed] error: {e}")
+        return None
+
+# ── SQLite vector search ──────────────────────────────────────────────────────
+
+def _sqlite_vsearch(query: str, top_k: int = TOP_K) -> List[dict]:
+    """Direct sqlite-vec cosine search on QMD index, rag-kb collection only."""
+    vec_bytes = _get_embedding(query)
+    if vec_bytes is None:
+        return []
+    try:
+        db = sqlite3.connect(QMD_DB_PATH)
+        db.enable_load_extension(True)
+        db.load_extension(VEC0_SO)
+        db.enable_load_extension(False)
+
+        rows = db.execute("""
+            SELECT
+                d.title,
+                d.path,
+                cv.hash,
+                cv.pos,
+                1 - vv.distance AS score
+            FROM vectors_vec vv
+            JOIN content_vectors cv ON cv.hash || '_' || cv.seq = vv.hash_seq
+            JOIN documents d ON d.hash = cv.hash
+            WHERE d.collection = ?
+              AND vv.embedding MATCH ?
+              AND k = ?
+            ORDER BY score DESC
+        """, (QMD_COLL, vec_bytes, top_k * 3)).fetchall()
+        db.close()
+
+        results = []
+        seen_hashes = set()
+        for title, fpath, chash, pos, score in rows:
+            if chash in seen_hashes:
+                continue
+            seen_hashes.add(chash)
+            # Read snippet from content table
+            db2 = sqlite3.connect(QMD_DB_PATH)
+            content_row = db2.execute("SELECT doc FROM content WHERE hash=?", (chash,)).fetchone()
+            db2.close()
+            body = ""
+            if content_row:
+                full = content_row[0]
+                body = full[pos:pos+400] if pos < len(full) else full[:400]
+            results.append({
+                "score": round(score, 4),
+                "title": title,
+                "file": fpath,
+                "body": body,
+            })
+            if len(results) >= top_k:
+                break
+        return results
+    except Exception as e:
+        print(f"[sqlite_vsearch] error: {e}")
         return []
 
-def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 135) -> List[str]:
-    """Split text into overlapping chunks."""
-    chunks, i = [], 0
-    while i < len(text):
-        chunks.append(text[i:i + chunk_size])
-        i += chunk_size - overlap
-    return [c for c in chunks if c.strip()]
+# ── QMD update+embed (background, for new uploads) ───────────────────────────
 
-def _write_doc_to_kb(file_id: str, filename: str, source_name: str, text: str):
-    """Write document as markdown files in KB_DOCS_DIR for QMD indexing."""
-    doc_dir = KB_DOCS_DIR / file_id
-    doc_dir.mkdir(parents=True, exist_ok=True)
-    chunks = _chunk_text(text)
-    for i, chunk in enumerate(chunks):
-        md_path = doc_dir / f"chunk_{i:04d}.md"
-        md_path.write_text(
-            f"---\nsource: {source_name}\nfilename: {filename}\nfile_id: {file_id}\nchunk: {i}\n---\n\n{chunk}",
-            encoding="utf-8"
-        )
-
-def _remove_doc_from_kb(file_id: str):
-    """Remove document chunks from KB_DOCS_DIR."""
-    doc_dir = KB_DOCS_DIR / file_id
-    if doc_dir.exists():
-        shutil.rmtree(doc_dir)
+def _qmd_update_embed():
+    try:
+        subprocess.run([QMD_BIN, "update"], capture_output=True, timeout=120)
+        subprocess.run([QMD_BIN, "embed"], capture_output=True, timeout=600)
+    except Exception as e:
+        print(f"[qmd embed] warning: {e}")
 
 def _auth(token: Optional[str]) -> bool:
     return token is not None and token in _sessions
@@ -96,7 +131,6 @@ def _auth(token: Optional[str]) -> bool:
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
-    KB_DOCS_DIR.mkdir(parents=True, exist_ok=True)
     _load_filemeta()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -330,10 +364,11 @@ async def upload_form(
 
     file_id  = str(uuid.uuid4())
     save_ext = Path(file.filename).suffix if file.filename else ".txt"
+    # Always save as .txt or .md so QMD collection can index it
+    if save_ext.lower() not in ('.txt', '.md'):
+        save_ext = '.txt'
     save_path = FILES_DIR / f"{file_id}{save_ext}"
-    save_path.write_bytes(raw)
-
-    _write_doc_to_kb(file_id, file.filename or "unnamed", name, text)
+    save_path.write_text(text, encoding="utf-8")
 
     _filemeta.append({
         "id": file_id,
@@ -387,7 +422,6 @@ def delete_file(file_id: str, rag_token: Optional[str] = Cookie(None)):
     if p.exists():
         p.unlink()
 
-    _remove_doc_from_kb(file_id)
     _filemeta = [f for f in _filemeta if f["id"] != file_id]
     _save_filemeta()
 
@@ -510,7 +544,7 @@ def health():
 
 @app.get("/search")
 def search_api(q: str, top_k: int = TOP_K, source: Optional[str] = None):
-    results = _qmd_vsearch(q, top_k)
+    results = _sqlite_vsearch(q, top_k)
     if source:
         results = [r for r in results if source.lower() in (r.get("title","") + r.get("file","")).lower()]
     return {"query": q, "results": results[:top_k]}
@@ -525,7 +559,6 @@ async def upload_text_api(payload: dict):
     file_id = str(uuid.uuid4())
     save_path = FILES_DIR / f"{file_id}.txt"
     save_path.write_text(text, encoding="utf-8")
-    _write_doc_to_kb(file_id, f"{source}.txt", source, text)
     _filemeta.append({
         "id": file_id,
         "filename": f"{source}.txt",
