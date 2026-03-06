@@ -842,6 +842,8 @@ async def grade_api(payload: dict):
     )
     grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
 
+⚠️ 重要規則：評分時必須嚴格遵守「評分方式」文件中的每一條規則。分數只能按照評分標準計算，不得自行加分、寬鬆評分或給予同情分。若程式碼未完整實作某功能，該項目只能得到實際完成比例應得的分數。
+
 請根據以下資訊進行評分：
 
 # 考題內容
@@ -960,6 +962,8 @@ async def grade_stream(repo_url: str, token: str = ""):
             )
 
             grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
+
+⚠️ 重要規則：評分時必須嚴格遵守「評分方式」文件中的每一條規則。分數只能按照評分標準計算，不得自行加分、寬鬆評分或給予同情分。若程式碼未完整實作某功能，該項目只能得到實際完成比例應得的分數。
 
 請根據以下資訊進行評分：
 
@@ -1468,9 +1472,18 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
         "Copilot-Integration-Id": "vscode-chat",
         "Editor-Version": "vscode/1.95.0",
     }
+    system_msg = (
+        "你是一位嚴格、公正的作業評審。評分時必須嚴格遵守「評分方式」文件中的每一條規則，"
+        "不得隨意加分或減分，分數必須完全依照評分標準計算。"
+        "若程式碼未達標準，即使部分完成也只能給予該部分應得分數，不得給予同情分。"
+        "回應請使用繁體中文。"
+    )
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt}
+        ],
         "max_tokens": 4096,
     }
     async with httpx.AsyncClient(timeout=180) as client:
@@ -1599,9 +1612,17 @@ async def regen_report(payload: dict):
         "Copilot-Integration-Id": "vscode-chat",
         "Editor-Version": "vscode/1.95.0",
     }
+    regen_system = (
+        "你是一位嚴格、公正的作業評審。重新產製評分報告時，只能根據老師明確指出的修正意見調整分數，"
+        "其餘項目必須維持原始評分標準，不得自行加分或寬鬆評分。"
+        "任何分數調整都必須在評語中清楚說明修正原因。回應請使用繁體中文。"
+    )
     body = {
         "model": "claude-sonnet-4.6",
-        "messages": [{"role": "user", "content": regen_prompt}],
+        "messages": [
+            {"role": "system", "content": regen_system},
+            {"role": "user", "content": regen_prompt}
+        ],
         "max_tokens": 4096,
     }
     try:
