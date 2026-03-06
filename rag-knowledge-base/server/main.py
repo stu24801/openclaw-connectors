@@ -255,7 +255,7 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
 
 <div class="card">
   <h2>📤 上傳文件</h2>
-  <form method="post" action="/upload_form" enctype="multipart/form-data">
+  <form method="post" action="/upload_form" enctype="multipart/form-data" onsubmit="showUploadLoading(this)">
     <div class="form-row" style="margin-bottom:14px">
       <div>
         <label>選擇檔案（.txt / .md / .pdf）</label>
@@ -266,8 +266,19 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
         <input type="text" name="source_name" placeholder="e.g. 產品手冊">
       </div>
     </div>
-    <button class="btn" type="submit">上傳並向量化</button>
+    <button class="btn" id="upload-btn" type="submit">上傳並向量化</button>
+    <span id="upload-loading" style="display:none;margin-left:14px;color:#94a3b8;font-size:.85rem">
+      <span style="display:inline-block;width:14px;height:14px;border:2px solid #4b5563;border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:6px"></span>
+      上傳中，請稍候…
+    </span>
   </form>
+<style>@keyframes spin {{ to {{ transform:rotate(360deg) }} }}</style>
+<script>
+function showUploadLoading(form) {{
+  document.getElementById('upload-btn').disabled = true;
+  document.getElementById('upload-loading').style.display = 'inline';
+}}
+</script>
 </div>
 
 <div class="card">
@@ -395,42 +406,96 @@ def search_ui(q: str = "", rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
 
-    results_html = ""
-    if q:
-        raw_results = _qmd_vsearch(q, TOP_K)
-        if not raw_results:
-            results_html = '<div class="alert alert-error">知識庫為空或尚未建立向量索引，請上傳文件後稍候再試。</div>'
-        else:
-            rows = ""
-            for r in raw_results[:TOP_K]:
-                score = r.get("score", 0)
-                source = r.get("title", r.get("file", "—"))
-                body_text = (r.get("body") or r.get("snippet") or "")[:300]
-                body_text = body_text.replace("<","&lt;").replace(">","&gt;")
-                rows += f"""<tr>
-  <td style="color:#a78bfa;font-weight:600">{score:.3f}</td>
-  <td><span class="badge badge-purple">{source}</span></td>
-  <td style="white-space:pre-wrap;font-size:.8rem;color:#cbd5e1">{body_text}…</td>
-</tr>"""
-            if rows:
-                results_html = f"""<table>
-<thead><tr><th>相關度</th><th>來源</th><th>內容片段</th></tr></thead>
-<tbody>{rows}</tbody></table>"""
-            else:
-                results_html = '<div class="empty">沒有找到相關段落。</div>'
-
     body = f"""
 <div class="card">
   <h2>🔍 語意搜尋</h2>
-  <form method="get" action="/search_ui" style="margin-bottom:20px">
-    <div class="form-row">
-      <input type="text" name="q" value="{q}" placeholder="輸入查詢關鍵字…" autofocus>
-      <button class="btn" type="submit">搜尋</button>
-      <a href="/dashboard" class="btn btn-ghost">← 返回</a>
+  <div class="form-row" style="margin-bottom:20px">
+    <input type="text" id="search-input" value="{q}" placeholder="輸入查詢關鍵字…" autofocus
+           onkeydown="if(event.key==='Enter')doSearch()">
+    <button class="btn" id="search-btn" onclick="doSearch()">搜尋</button>
+    <a href="/dashboard" class="btn btn-ghost">← 返回</a>
+  </div>
+
+  <!-- Loading spinner -->
+  <div id="loading" style="display:none;text-align:center;padding:40px">
+    <div class="spinner"></div>
+    <div style="color:#94a3b8;font-size:.85rem;margin-top:14px">向量搜尋中，請稍候…<br>
+      <span style="font-size:.75rem;color:#4b5563">（首次查詢需要 10–30 秒載入模型）</span>
     </div>
-  </form>
-  {results_html}
-</div>"""
+  </div>
+
+  <!-- Results area -->
+  <div id="results"></div>
+</div>
+
+<style>
+.spinner {{
+  width:40px;height:40px;margin:0 auto;
+  border:3px solid #2d3154;
+  border-top-color:#a78bfa;
+  border-radius:50%;
+  animation:spin 0.8s linear infinite;
+}}
+@keyframes spin {{ to {{ transform:rotate(360deg) }} }}
+</style>
+
+<script>
+const initialQ = {json.dumps(q)};
+
+async function doSearch() {{
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) return;
+
+  // Update URL without reload
+  history.replaceState(null, '', '/search_ui?q=' + encodeURIComponent(q));
+
+  // Show loading, hide results
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('search-btn').disabled = true;
+
+  try {{
+    const res = await fetch('/search?q=' + encodeURIComponent(q) + '&top_k=5');
+    const data = await res.json();
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('search-btn').disabled = false;
+
+    if (!data.results || data.results.length === 0) {{
+      document.getElementById('results').innerHTML =
+        '<div class="empty">沒有找到相關段落。<br><span style="font-size:.8rem;color:#4b5563">請確認文件已上傳並完成向量化（約需 15 秒）</span></div>';
+      return;
+    }}
+
+    let rows = '';
+    for (const r of data.results) {{
+      const score = (r.score || 0).toFixed(3);
+      const source = r.title || r.file || '—';
+      const body = (r.body || r.snippet || '').substring(0, 300)
+        .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      rows += `<tr>
+        <td style="color:#a78bfa;font-weight:600">${{score}}</td>
+        <td><span class="badge badge-purple">${{source}}</span></td>
+        <td style="white-space:pre-wrap;font-size:.8rem;color:#cbd5e1">${{body}}…</td>
+      </tr>`;
+    }}
+    document.getElementById('results').innerHTML = `
+      <table>
+        <thead><tr><th>相關度</th><th>來源</th><th>內容片段</th></tr></thead>
+        <tbody>${{rows}}</tbody>
+      </table>`;
+  }} catch(e) {{
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('search-btn').disabled = false;
+    document.getElementById('results').innerHTML =
+      '<div class="alert alert-error">搜尋失敗：' + e.message + '</div>';
+  }}
+}}
+
+// Auto-search if query param is set
+if (initialQ) doSearch();
+</script>
+"""
     return HTMLResponse(_base_html(body, "搜尋 — RAG KB"))
 
 
