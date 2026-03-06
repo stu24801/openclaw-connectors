@@ -1125,12 +1125,35 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
 
 <div id="error-area"></div>
 
+<!-- 對話視窗（評分完成後出現）-->
+<div id="chat-card" style="display:none">
+  <div class="card">
+    <h2>💬 與 AI 討論評分結果</h2>
+    <p style="font-size:.83rem;color:#64748b;margin-bottom:14px">評分報告已作為 context，可直接詢問如何改善、解釋評分理由、或討論具體題目</p>
+    <div id="chat-messages" style="
+      background:#0a0a0f;border:1px solid #1e2235;border-radius:8px;
+      padding:14px;min-height:120px;max-height:480px;overflow-y:auto;
+      font-size:.87rem;line-height:1.7;margin-bottom:12px
+    "></div>
+    <div style="display:flex;gap:10px;align-items:flex-end">
+      <textarea id="chat-input" rows="2" placeholder="例如：第 3 題為什麼只得 X 分？如何改善？"
+        style="flex:1;resize:vertical;min-height:56px;font-family:inherit;font-size:.87rem"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendChat();}}"></textarea>
+      <button class="btn" id="chat-send-btn" onclick="sendChat()" style="white-space:nowrap">
+        ➤ 送出
+      </button>
+    </div>
+    <div style="font-size:.75rem;color:#475569;margin-top:6px">Enter 送出 ｜ Shift+Enter 換行</div>
+  </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 let _prompt   = '';
 let _reportMd = '';
 let _sse      = null;
 let _meta     = {{}};
+let _chatHistory = [];  // {{role, content}}
 
 function log(msg) {{
   const el = document.getElementById('progress-log');
@@ -1192,6 +1215,11 @@ function doGrade() {{
         document.getElementById('report-card').style.display = 'block';
         document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
         log('<span style="color:#86efac">✅ AI 評分完成！</span>');
+        // Show chat panel
+        _chatHistory = [];
+        document.getElementById('chat-card').style.display = 'block';
+        document.getElementById('chat-messages').innerHTML = '';
+        appendChatMsg('assistant', '評分完成！您可以在這裡詢問任何關於評分結果的問題，例如：「第 3 題為何扣分？」、「如何改善這份作業？」、「幫我寫一份改進建議給同學」');
       }} else {{
         log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
       }}
@@ -1269,6 +1297,70 @@ function downloadReport() {{
 
 function escHtml(s) {{
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function appendChatMsg(role, content) {{
+  const el = document.getElementById('chat-messages');
+  const isUser = role === 'user';
+  const div = document.createElement('div');
+  div.style.cssText = `margin-bottom:14px;display:flex;flex-direction:column;align-items:${{isUser?'flex-end':'flex-start'}}`;
+  const bubble = document.createElement('div');
+  bubble.style.cssText = `
+    max-width:85%;padding:10px 14px;border-radius:12px;font-size:.87rem;line-height:1.6;
+    background:${{isUser?'#3b3f6e':'#1a1d2e'}};
+    color:${{isUser?'#e2e8f0':'#cbd5e1'}};
+    border:1px solid ${{isUser?'#4f54a0':'#2d3154'}};
+  `;
+  bubble.innerHTML = isUser ? escHtml(content) : marked.parse(content);
+  div.appendChild(bubble);
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}}
+
+function appendChatThinking() {{
+  const el = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.id = 'chat-thinking';
+  div.style.cssText = 'margin-bottom:14px;display:flex;align-items:flex-start';
+  div.innerHTML = '<div style="padding:10px 14px;background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;color:#64748b;font-size:.87rem">⏳ AI 思考中…</div>';
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}}
+
+async function sendChat() {{
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg || !_reportMd) return;
+  input.value = '';
+  document.getElementById('chat-send-btn').disabled = true;
+
+  // Add user message to UI and history
+  appendChatMsg('user', msg);
+  _chatHistory.push({{role:'user', content: msg}});
+  appendChatThinking();
+
+  try {{
+    const resp = await fetch('/chat_with_report', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        report: _reportMd,
+        history: _chatHistory.slice(0, -1),  // exclude current msg
+        message: msg
+      }})
+    }});
+    const data = await resp.json();
+    document.getElementById('chat-thinking')?.remove();
+
+    const reply = data.reply || '（無回應）';
+    appendChatMsg('assistant', reply);
+    _chatHistory.push({{role:'assistant', content: reply}});
+  }} catch(e) {{
+    document.getElementById('chat-thinking')?.remove();
+    appendChatMsg('assistant', '❌ 連線失敗：' + String(e));
+  }}
+  document.getElementById('chat-send-btn').disabled = false;
+  document.getElementById('chat-input').focus();
 }}
 </script>
 """
@@ -1366,3 +1458,56 @@ async def ai_grade(payload: dict):
             "auto": False,
             "message": f"AI 評分失敗（{e}），請複製 Prompt 到 Claude / ChatGPT"
         }
+
+
+@app.post("/chat_with_report")
+async def chat_with_report(payload: dict):
+    """Chat with LLM using grading report as system context."""
+    import httpx
+    report  = payload.get("report", "")
+    history = payload.get("history", [])   # [{role, content}, ...]
+    message = payload.get("message", "").strip()
+    if not message:
+        raise HTTPException(400, "message required")
+
+    token = _load_copilot_token()
+    if not token:
+        raise HTTPException(503, "GitHub Copilot token not available")
+
+    # Build messages: system context + history + new message
+    system_content = (
+        "你是一位作業評分助理。以下是這份作業的 AI 評分報告，請根據報告內容回答使用者的問題。"
+        "回答請使用繁體中文，語氣友善專業。\n\n"
+        f"## 評分報告\n\n{report}"
+    )
+    messages = [{"role": "system", "content": system_content}]
+    for h in history[-10:]:  # keep last 10 turns
+        role = h.get("role", "user")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": "vscode/1.95.0",
+    }
+    body = {
+        "model": "claude-sonnet-4.6",
+        "messages": messages,
+        "max_tokens": 2048,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                "https://api.githubcopilot.com/chat/completions",
+                headers=headers, json=body
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"]
+        return {"reply": reply}
+    except Exception as e:
+        raise HTTPException(500, f"LLM 呼叫失敗：{e}")
