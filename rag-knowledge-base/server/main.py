@@ -253,7 +253,7 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = ""):
         return RedirectResponse("/login")
 
     doc_count   = len(_filemeta)
-    chunk_count = sum(len(list((KB_DOCS_DIR / f["id"]).glob("chunk_*.md"))) for f in _filemeta if (KB_DOCS_DIR / f["id"]).exists())
+    chunk_count = len(_filemeta)
     ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
 
     if _filemeta:
@@ -573,7 +573,7 @@ async def upload_text_api(payload: dict):
     import threading
     threading.Thread(target=_qmd_update_embed, daemon=True).start()
 
-    chunks_written = len(list((KB_DOCS_DIR / file_id).glob("chunk_*.md")))
+    chunks_written = 1
     return {"source": source, "chunks_added": chunks_written, "total_docs": len(_filemeta)}
 
 @app.get("/sources")
