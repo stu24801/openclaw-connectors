@@ -1177,6 +1177,28 @@ function doGrade() {{
       data.owner + '/' + data.repo + ' @' + data.branch +
       ' ｜ ' + data.file_count + ' 個檔案 ｜ 可對照題目：' + data.questions_available.join('、');
     document.getElementById('prompt-box').textContent = _prompt;
+
+    // Auto-call AI grading
+    log('<span style="color:#60a5fa">🤖 正在呼叫 AI 評分（claude-sonnet-4.6）...</span>');
+    fetch('/ai_grade', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ prompt: _prompt, meta: _meta }})
+    }})
+    .then(r => r.json())
+    .then(result => {{
+      if (result.auto) {{
+        _reportMd = result.report;
+        document.getElementById('report-card').style.display = 'block';
+        document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
+        log('<span style="color:#86efac">✅ AI 評分完成！</span>');
+      }} else {{
+        log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
+      }}
+    }})
+    .catch(e => {{
+      log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
+    }});
   }});
 
   _sse.addEventListener('error', e => {{
@@ -1253,29 +1275,65 @@ function escHtml(s) {{
     return HTMLResponse(_base_html(body, "評分 — RAG KB"))
 
 
+def _load_copilot_token() -> str | None:
+    """Load GitHub Copilot token from OpenClaw credentials."""
+    token_path = os.path.expanduser("~/.openclaw/credentials/github-copilot.token.json")
+    try:
+        with open(token_path) as f:
+            data = json.load(f)
+        token = data.get("token", "")
+        expires_at = data.get("expiresAt", 0)
+        import time
+        if expires_at and expires_at < time.time() * 1000:
+            return None  # expired
+        return token if token else None
+    except Exception:
+        return None
+
+
+async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> str:
+    """Call GitHub Copilot API (OpenAI-compatible) with the given prompt."""
+    import httpx
+    token = _load_copilot_token()
+    if not token:
+        raise RuntimeError("GitHub Copilot token not available or expired")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": "vscode/1.95.0",
+    }
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+    }
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(
+            "https://api.githubcopilot.com/chat/completions",
+            headers=headers,
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
-    """Attempt AI grading via openclaw/clawd, fallback to prompt."""
+    """Grade using GitHub Copilot API (claude-sonnet-4.6 via GitHub Copilot)."""
     prompt = payload.get("prompt", "")
-    meta   = payload.get("meta", {})
     if not prompt:
         raise HTTPException(400, "prompt required")
 
-    openclaw_bin = shutil.which("openclaw") or shutil.which("clawd")
-    if openclaw_bin:
-        try:
-            result = subprocess.run(
-                [openclaw_bin, "exec", "--no-stream", prompt],
-                capture_output=True, text=True, timeout=180,
-                env={**os.environ, "HOME": os.path.expanduser("~")},
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"report": result.stdout.strip(), "auto": True}
-        except Exception:
-            pass
-
-    return {
-        "report": prompt,
-        "auto": False,
-        "message": "AI 推論離線，請複製 Prompt 到 Claude / ChatGPT"
-    }
+    try:
+        report = await _call_copilot_api(prompt)
+        return {"report": report, "auto": True}
+    except Exception as e:
+        # Fallback: return prompt for manual use
+        return {
+            "report": prompt,
+            "auto": False,
+            "message": f"AI 評分失敗（{e}），請複製 Prompt 到 Claude / ChatGPT"
+        }
