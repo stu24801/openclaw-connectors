@@ -4,12 +4,13 @@ v2: 支援分層分類 (category) 管理與搜尋過濾
 """
 
 import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, struct, urllib.request
+import threading, queue, time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Cookie, Response
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, StreamingResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
@@ -797,40 +798,32 @@ def _should_read(path: str) -> bool:
 @app.post("/grade")
 async def grade_api(payload: dict):
     """
-    Grade a GitHub repo against KB questions and scoring criteria.
+    Collect GitHub repo code + KB questions/scoring → return grading context.
     Body: { "repo_url": "...", "token": "ghp_xxx (optional)" }
-    Returns: { "question": "...", "report": "markdown...", "raw_code_summary": [...] }
     """
     repo_url = payload.get("repo_url", "").strip()
     token    = (payload.get("token") or "").strip() or None
     if not repo_url:
         raise HTTPException(400, "repo_url is required")
 
-    # 1. Parse URL
     try:
         owner, repo, branch = _parse_github_url(repo_url)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # 2. Get all questions from KB
     questions = [f for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")]
     scoring   = [f for f in _filemeta if "評分" in f.get("category","") or "評分" in f.get("source_name","")]
-
     if not questions:
-        raise HTTPException(404, "知識庫中找不到題目文件，請先上傳題目到分類「新人面試題庫/題目_md」")
+        raise HTTPException(404, "知識庫中找不到題目文件")
     if not scoring:
-        raise HTTPException(404, "知識庫中找不到評分方式文件，請先上傳評分方式到分類「新人面試題庫/評分方式_md」")
+        raise HTTPException(404, "知識庫中找不到評分方式文件")
 
-    # 3. Read scoring criteria
     scoring_content = Path(scoring[0]["path"]).read_text(encoding="utf-8")
-
-    # 4. Get repo file tree
     try:
         tree = _github_tree(owner, repo, branch, token)
     except Exception as e:
         raise HTTPException(502, f"GitHub API 錯誤：{e}")
 
-    # 5. Read priority files (max 30)
     code_files = [item["path"] for item in tree if _should_read(item["path"])][:30]
     code_snippets = []
     for fpath in code_files:
@@ -838,29 +831,16 @@ async def grade_api(payload: dict):
         if content:
             code_snippets.append({"path": fpath, "content": content[:3000]})
 
-    # 6. Concatenate all questions text
     questions_text = ""
     for q in questions:
         qcontent = Path(q["path"]).read_text(encoding="utf-8")
         questions_text += f"\n\n---\n## 題目：{q['source_name']}\n{qcontent}"
 
-    # 7. Build prompt for OpenClaw
     code_summary = "\n\n".join(
         f"### {s['path']}\n```\n{s['content'][:1500]}\n```"
         for s in code_snippets[:15]
     )
-
-    return {
-        "owner": owner,
-        "repo": repo,
-        "branch": branch,
-        "file_count": len(tree),
-        "code_files_read": len(code_snippets),
-        "questions_available": [q["source_name"] for q in questions],
-        "scoring_criteria": scoring_content,
-        "questions_text": questions_text,
-        "code_summary": code_summary,
-        "grading_prompt": f"""你是一位嚴格但公正的後端工程師面試評審。
+    grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
 
 請根據以下資訊進行評分：
 
@@ -886,9 +866,8 @@ async def grade_api(payload: dict):
 
 2. **逐項評分**：按照「評分方式」的每個評分項目，逐一評定是否達標，給出分數。
 
-3. **輸出報告**：以下列格式輸出完整評分報告：
+3. **輸出報告**，格式如下：
 
-```
 # 📋 評分報告
 
 ## 基本資訊
@@ -900,20 +879,156 @@ async def grade_api(payload: dict):
 （說明對應哪一題及判斷依據）
 
 ## 📊 評分結果
-
-（依評分方式逐項評分）
+（依評分方式逐項評分，含✅⚠️❌）
 
 ## 💯 總分
-（統計各項得分）
+（各項得分統計表格）
 
 ## 💡 改進建議
-（列出主要缺失與建議）
-```
-""",
+（主要缺失與建議）
+"""
+    return {
+        "owner": owner, "repo": repo, "branch": branch,
+        "file_count": len(tree), "code_files_read": len(code_snippets),
+        "questions_available": [q["source_name"] for q in questions],
+        "grading_prompt": grading_prompt,
     }
 
+
+@app.get("/grade_stream")
+async def grade_stream(repo_url: str, token: str = ""):
+    """
+    SSE endpoint: streams grading progress events then final prompt.
+    GET /grade_stream?repo_url=...&token=...
+    """
+    _token = token.strip() or None
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        def sse(event: str, data: str) -> str:
+            # Escape newlines in data
+            data_lines = "\n".join(f"data: {line}" for line in data.split("\n"))
+            return f"event: {event}\n{data_lines}\n\n"
+
+        try:
+            yield sse("progress", "🔍 解析 GitHub URL…")
+            try:
+                owner, repo, branch = _parse_github_url(repo_url)
+            except ValueError as e:
+                yield sse("error", str(e)); return
+
+            yield sse("progress", f"📚 從知識庫載入題目與評分方式…")
+            questions = [f for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")]
+            scoring   = [f for f in _filemeta if "評分" in f.get("category","") or "評分" in f.get("source_name","")]
+            if not questions:
+                yield sse("error", "知識庫中找不到題目文件，請先上傳"); return
+            if not scoring:
+                yield sse("error", "知識庫中找不到評分方式文件，請先上傳"); return
+
+            scoring_content = Path(scoring[0]["path"]).read_text(encoding="utf-8")
+            q_names = [q["source_name"] for q in questions]
+            yield sse("progress", f"✅ 已載入 {len(questions)} 道題目：{', '.join(q_names)}")
+
+            yield sse("progress", f"🌐 連接 GitHub API，取得 {owner}/{repo}@{branch} 檔案列表…")
+            try:
+                tree = _github_tree(owner, repo, branch, _token)
+            except Exception as e:
+                yield sse("error", f"GitHub API 錯誤：{e}"); return
+            yield sse("progress", f"📁 共找到 {len(tree)} 個檔案")
+
+            code_files = [item["path"] for item in tree if _should_read(item["path"])][:30]
+            yield sse("progress", f"📖 讀取 {len(code_files)} 個程式碼檔案…")
+
+            code_snippets = []
+            for i, fpath in enumerate(code_files):
+                content = _github_file(owner, repo, branch, fpath, _token)
+                if content:
+                    code_snippets.append({"path": fpath, "content": content[:3000]})
+                if (i+1) % 5 == 0:
+                    yield sse("progress", f"  已讀取 {i+1}/{len(code_files)} 個檔案…")
+
+            yield sse("progress", f"✅ 成功讀取 {len(code_snippets)} 個程式碼檔案")
+
+            # Build questions text
+            questions_text = ""
+            for q in questions:
+                qcontent = Path(q["path"]).read_text(encoding="utf-8")
+                questions_text += f"\n\n---\n## 題目：{q['source_name']}\n{qcontent}"
+
+            code_summary = "\n\n".join(
+                f"### {s['path']}\n```\n{s['content'][:1500]}\n```"
+                for s in code_snippets[:15]
+            )
+
+            grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
+
+請根據以下資訊進行評分：
+
+# 考題內容
+{questions_text}
+
+# 評分方式
+{scoring_content}
+
+# 應試者的 GitHub Repo
+- URL: {repo_url}
+- 分支: {branch}
+- 共 {len(tree)} 個檔案，已讀取 {len(code_snippets)} 個主要程式碼檔案
+
+# 程式碼內容
+{code_summary}
+
+---
+
+請完成以下任務：
+
+1. **判定題目**：分析程式碼，確認這份 repo 對應「考題內容」中的哪一道題目，說明判斷依據。
+
+2. **逐項評分**：按照「評分方式」的每個評分項目，逐一評定是否達標，給出分數。
+
+3. **輸出報告**，格式如下：
+
+# 📋 評分報告
+
+## 基本資訊
+- Repo: {repo_url}
+- 分支: {branch}
+- 評分時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## 🎯 題目判定
+（說明對應哪一題及判斷依據）
+
+## 📊 評分結果
+（依評分方式逐項評分，含✅⚠️❌）
+
+## 💯 總分
+（各項得分統計表格）
+
+## 💡 改進建議
+（主要缺失與建議）
+"""
+            yield sse("progress", "✅ 評分 Prompt 已建立完成！")
+            # Send the full prompt as a done event
+            yield sse("done", json.dumps({
+                "owner": owner, "repo": repo, "branch": branch,
+                "file_count": len(tree), "code_files_read": len(code_snippets),
+                "questions_available": q_names,
+                "grading_prompt": grading_prompt,
+            }))
+
+        except Exception as e:
+            yield sse("error", f"未預期的錯誤：{e}")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        }
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Grade UI
+#  Grade UI  (SSE version)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/grade_ui", response_class=HTMLResponse)
@@ -921,7 +1036,6 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
 
-    # Count available questions
     question_count = len([f for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")])
     scoring_count  = len([f for f in _filemeta if "評分" in f.get("category","") or "評分" in f.get("source_name","")])
     q_list = [f["source_name"] for f in _filemeta if "題目" in f.get("category","") or "題目" in f.get("source_name","")]
@@ -929,14 +1043,13 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
     status_color = "#86efac" if question_count > 0 and scoring_count > 0 else "#fca5a5"
     status_icon  = "✅" if question_count > 0 and scoring_count > 0 else "⚠️"
     status_msg   = f"{question_count} 道題目、{scoring_count} 份評分方式已載入" if question_count > 0 else "尚未上傳題目或評分方式，請先至 Dashboard 上傳"
-
     q_badges = "".join(f'<span class="badge badge-blue" style="margin:2px">{q}</span>' for q in q_list)
 
     body = f"""
 <div class="card">
   <h2>📝 GitHub 作業自動評分</h2>
 
-  <!-- KB 狀態 -->
+  <!-- KB 狀態列 -->
   <div style="background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;margin-bottom:20px;display:flex;align-items:center;gap:12px">
     <span style="font-size:1.4rem">{status_icon}</span>
     <div>
@@ -945,134 +1058,183 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
     </div>
   </div>
 
-  <!-- 輸入表單 -->
-  <div style="margin-bottom:16px">
-    <label>GitHub Repo URL</label>
-    <input type="text" id="repo-url" placeholder="https://github.com/owner/repo/tree/main"
-           style="margin-bottom:12px">
-    <label>GitHub Token（選填，私有 repo 才需要）</label>
-    <input type="text" id="gh-token" placeholder="ghp_xxxxx（選填）">
-  </div>
-
-  <button class="btn" id="grade-btn" onclick="doGrade()">🚀 開始評分</button>
-  <span style="margin-left:12px;font-size:.8rem;color:#64748b">評分約需 30–60 秒</span>
-</div>
-
-<!-- Loading -->
-<div id="loading" style="display:none">
-  <div class="card" style="text-align:center;padding:48px">
-    <div class="spinner" style="margin-bottom:16px"></div>
-    <div style="color:#a78bfa;font-weight:600;margin-bottom:8px">正在分析 Repo 並評分中…</div>
-    <div id="loading-step" style="color:#64748b;font-size:.85rem">讀取題目與評分方式</div>
-  </div>
-</div>
-
-<!-- Result -->
-<div id="result-area" style="display:none">
-  <div class="card">
-    <h2>📊 評分報告</h2>
-    <div style="display:flex;gap:10px;margin-bottom:16px">
-      <button class="btn btn-sm btn-ghost" onclick="copyReport()">📋 複製報告</button>
-      <button class="btn btn-sm btn-ghost" onclick="downloadReport()">⬇ 下載 .md</button>
+  <!-- 輸入 -->
+  <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:14px;align-items:end">
+    <div>
+      <label>GitHub Repo URL</label>
+      <input type="text" id="repo-url" placeholder="https://github.com/owner/repo/tree/main">
     </div>
-    <div id="report-md" style="display:none"></div>
-    <div id="report-html" style="
-      background:#0f1117;border:1px solid #2d3154;border-radius:8px;
-      padding:20px;font-size:.88rem;line-height:1.7;overflow-x:auto;
-      white-space:pre-wrap;font-family:'Segoe UI',sans-serif;color:#e2e8f0
+    <div>
+      <label>GitHub Token（私有 repo 才需要）</label>
+      <input type="text" id="gh-token" placeholder="ghp_xxxxx（選填）" style="width:260px">
+    </div>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px">
+    <button class="btn" id="grade-btn" onclick="doGrade()">🚀 開始評分</button>
+    <button class="btn btn-ghost" id="stop-btn" style="display:none" onclick="stopGrade()">⏹ 停止</button>
+    <span style="font-size:.8rem;color:#64748b">資料收集完成後會立即顯示 Prompt，無需等待 AI 評分</span>
+  </div>
+</div>
+
+<!-- 進度 Log -->
+<div id="progress-card" style="display:none">
+  <div class="card">
+    <h2>⏳ 進度</h2>
+    <div id="progress-log" style="
+      font-family:monospace;font-size:.82rem;color:#94a3b8;
+      background:#0a0a0f;border:1px solid #1e2235;border-radius:8px;
+      padding:14px;max-height:220px;overflow-y:auto;line-height:1.8
     "></div>
   </div>
 </div>
 
-<!-- Error -->
+<!-- Prompt 就緒（可提前使用）-->
+<div id="prompt-card" style="display:none">
+  <div class="card">
+    <h2>📄 評分 Prompt <span style="font-size:.75rem;color:#64748b;font-weight:400">— 可複製到任何 AI 立即評分</span></h2>
+    <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="copyPrompt()">📋 複製 Prompt</button>
+      <button class="btn btn-sm btn-ghost" onclick="downloadPrompt()">⬇ 下載 .txt</button>
+      <a id="open-claude" href="#" target="_blank" class="btn btn-sm btn-ghost"
+         style="text-decoration:none" onclick="openClaude()">🤖 在 Claude 開啟</a>
+    </div>
+    <div id="prompt-meta" style="font-size:.8rem;color:#64748b;margin-bottom:10px"></div>
+    <pre id="prompt-box" style="
+      white-space:pre-wrap;font-size:.78rem;color:#94a3b8;
+      background:#0a0a0f;border:1px solid #1e2235;border-radius:8px;
+      padding:14px;max-height:400px;overflow-y:auto
+    "></pre>
+  </div>
+</div>
+
+<!-- 報告區（AI 自動回傳時顯示）-->
+<div id="report-card" style="display:none">
+  <div class="card">
+    <h2>📊 AI 評分報告</h2>
+    <div style="display:flex;gap:10px;margin-bottom:14px">
+      <button class="btn btn-sm btn-ghost" onclick="copyReport()">📋 複製報告</button>
+      <button class="btn btn-sm btn-ghost" onclick="downloadReport()">⬇ 下載 .md</button>
+    </div>
+    <div id="report-html" style="
+      background:#0f1117;border:1px solid #2d3154;border-radius:8px;
+      padding:20px;font-size:.88rem;line-height:1.7;overflow-x:auto
+    "></div>
+  </div>
+</div>
+
 <div id="error-area"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
+let _prompt   = '';
 let _reportMd = '';
+let _sse      = null;
+let _meta     = {{}};
 
-async function doGrade() {{
+function log(msg) {{
+  const el = document.getElementById('progress-log');
+  el.innerHTML += msg + '<br>';
+  el.scrollTop = el.scrollHeight;
+}}
+
+function doGrade() {{
   const repoUrl = document.getElementById('repo-url').value.trim();
   const token   = document.getElementById('gh-token').value.trim();
   if (!repoUrl) {{ alert('請輸入 GitHub Repo URL'); return; }}
 
+  // Reset UI
   document.getElementById('grade-btn').disabled = true;
-  document.getElementById('loading').style.display = 'block';
-  document.getElementById('result-area').style.display = 'none';
+  document.getElementById('stop-btn').style.display = 'inline-block';
+  document.getElementById('progress-card').style.display = 'block';
+  document.getElementById('progress-log').innerHTML = '';
+  document.getElementById('prompt-card').style.display = 'none';
+  document.getElementById('report-card').style.display = 'none';
   document.getElementById('error-area').innerHTML = '';
+  _prompt = ''; _reportMd = '';
 
-  const steps = [
-    '讀取題目與評分方式…',
-    '連接 GitHub API，取得檔案列表…',
-    '讀取程式碼檔案…',
-    'AI 分析中，判定題目…',
-    '逐項評分中…',
-    '產生報告…',
-  ];
-  let si = 0;
-  const stepInterval = setInterval(() => {{
-    if (si < steps.length) {{
-      document.getElementById('loading-step').textContent = steps[si++];
-    }}
-  }}, 8000);
+  const params = new URLSearchParams({{ repo_url: repoUrl, token: token }});
+  _sse = new EventSource('/grade_stream?' + params.toString());
 
-  try {{
-    // Step 1: Get grading context from RAG KB
-    const gradeRes = await fetch('/grade', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ repo_url: repoUrl, token: token || null }}),
-    }});
-    if (!gradeRes.ok) {{
-      const err = await gradeRes.json();
-      throw new Error(err.detail || gradeRes.statusText);
-    }}
-    const gradeData = await gradeRes.json();
-    document.getElementById('loading-step').textContent = 'AI 評分中，請稍候…';
+  _sse.addEventListener('progress', e => {{
+    log('<span style="color:#a78bfa">' + escHtml(e.data) + '</span>');
+  }});
 
-    // Step 2: Call OpenClaw AI with the prompt
-    const aiRes = await fetch('/ai_grade', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ prompt: gradeData.grading_prompt, meta: gradeData }}),
-    }});
-    if (!aiRes.ok) {{
-      const err = await aiRes.json();
-      throw new Error(err.detail || aiRes.statusText);
-    }}
-    const aiData = await aiRes.json();
-    _reportMd = aiData.report;
-
-    clearInterval(stepInterval);
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('result-area').style.display = 'block';
+  _sse.addEventListener('done', e => {{
+    _sse.close();
+    document.getElementById('stop-btn').style.display = 'none';
     document.getElementById('grade-btn').disabled = false;
-    document.getElementById('report-md').textContent = _reportMd;
 
-    // If auto=false, show prompt-copy mode; otherwise render markdown
-    if (!aiData.auto) {{
-      document.getElementById('report-html').innerHTML = `
-        <div class="alert" style="background:#1c1a2e;border:1px solid #4b3f72;color:#c4b5fd;margin-bottom:16px">
-          ⚠️ 自動評分服務離線，已產生評分 Prompt，請複製後貼入 Claude / ChatGPT 進行評分。
-        </div>
-        <pre style="white-space:pre-wrap;font-size:.8rem;color:#94a3b8;background:#0a0a0f;
-          padding:16px;border-radius:8px;max-height:500px;overflow-y:auto">${{escHtml(_reportMd)}}</pre>`;
-    }} else {{
-      document.getElementById('report-html').innerHTML =
-        typeof marked !== 'undefined' ? marked.parse(_reportMd) : _reportMd;
-    }}
+    const data = JSON.parse(e.data);
+    _meta   = data;
+    _prompt = data.grading_prompt;
 
-  }} catch(e) {{
-    clearInterval(stepInterval);
-    document.getElementById('loading').style.display = 'none';
+    log('<span style="color:#86efac">✅ 完成！共讀取 ' + data.code_files_read + ' 個程式碼檔案</span>');
+
+    // Show prompt card immediately
+    document.getElementById('prompt-card').style.display = 'block';
+    document.getElementById('prompt-meta').textContent =
+      data.owner + '/' + data.repo + ' @' + data.branch +
+      ' ｜ ' + data.file_count + ' 個檔案 ｜ 可對照題目：' + data.questions_available.join('、');
+    document.getElementById('prompt-box').textContent = _prompt;
+  }});
+
+  _sse.addEventListener('error', e => {{
+    _sse.close();
+    document.getElementById('stop-btn').style.display = 'none';
     document.getElementById('grade-btn').disabled = false;
-    document.getElementById('error-area').innerHTML =
-      `<div class="alert alert-error">❌ 評分失敗：${{e.message}}</div>`;
+    if (e.data) {{
+      log('<span style="color:#fca5a5">❌ ' + escHtml(e.data) + '</span>');
+      document.getElementById('error-area').innerHTML =
+        '<div class="alert alert-error">❌ ' + escHtml(e.data) + '</div>';
+    }}
+  }});
+
+  _sse.onerror = () => {{
+    if (_sse.readyState === EventSource.CLOSED) return;
+    _sse.close();
+    document.getElementById('stop-btn').style.display = 'none';
+    document.getElementById('grade-btn').disabled = false;
+    log('<span style="color:#fca5a5">⚠️ SSE 連線中斷</span>');
+  }};
+}}
+
+function stopGrade() {{
+  if (_sse) {{ _sse.close(); _sse = null; }}
+  document.getElementById('stop-btn').style.display = 'none';
+  document.getElementById('grade-btn').disabled = false;
+  log('<span style="color:#fbbf24">⏹ 已停止</span>');
+  // Still show prompt if already collected
+  if (_prompt) {{
+    document.getElementById('prompt-card').style.display = 'block';
+    document.getElementById('prompt-box').textContent = _prompt;
   }}
 }}
 
+function copyPrompt() {{
+  navigator.clipboard.writeText(_prompt).then(() => alert('評分 Prompt 已複製！'));
+}}
+
+function downloadPrompt() {{
+  const blob = new Blob([_prompt], {{type:'text/plain'}});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'grading-prompt.txt';
+  a.click();
+}}
+
+function openClaude() {{
+  // Open Claude with the prompt pre-filled (via URL if supported)
+  window.open('https://claude.ai/new', '_blank');
+  // Also copy to clipboard so user can paste
+  navigator.clipboard.writeText(_prompt).then(() => {{
+    alert('已開啟 Claude，並將 Prompt 複製到剪貼簿，請在 Claude 貼上即可！');
+  }});
+  return false;
+}}
+
 function copyReport() {{
-  navigator.clipboard.writeText(_reportMd).then(() => alert('已複製到剪貼簿！'));
+  navigator.clipboard.writeText(_reportMd).then(() => alert('已複製報告！'));
 }}
 
 function downloadReport() {{
@@ -1084,7 +1246,7 @@ function downloadReport() {{
 }}
 
 function escHtml(s) {{
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }}
 </script>
 """
@@ -1093,15 +1255,12 @@ function escHtml(s) {{
 
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
-    """
-    Attempt AI grading via openclaw exec, fallback to returning prompt for manual use.
-    """
+    """Attempt AI grading via openclaw/clawd, fallback to prompt."""
     prompt = payload.get("prompt", "")
     meta   = payload.get("meta", {})
     if not prompt:
         raise HTTPException(400, "prompt required")
 
-    # Try openclaw exec (if available)
     openclaw_bin = shutil.which("openclaw") or shutil.which("clawd")
     if openclaw_bin:
         try:
@@ -1115,25 +1274,8 @@ async def ai_grade(payload: dict):
         except Exception:
             pass
 
-    # Fallback: return prompt so user can copy to any AI
-    report = f"""# 📋 評分 Prompt 已就緒
-
-> **AI 推論服務目前離線**，請將下方 Prompt 複製到 Claude / ChatGPT / 任何 AI 進行評分。
-
-## Repo 資訊
-- **Owner / Repo**: {meta.get('owner','')}/{meta.get('repo','')}
-- **分支**: {meta.get('branch','')}
-- **讀取程式碼檔案**: {meta.get('code_files_read', 0)} 個（共 {meta.get('file_count', 0)} 個檔案）
-
-## 可對照的題目
-{chr(10).join('- ' + q for q in meta.get('questions_available', []))}
-
----
-
-## 📄 完整評分 Prompt（複製以下內容給 AI）
-
-```
-{prompt}
-```
-"""
-    return {"report": report, "auto": False}
+    return {
+        "report": prompt,
+        "auto": False,
+        "message": "AI 推論離線，請複製 Prompt 到 Claude / ChatGPT"
+    }
