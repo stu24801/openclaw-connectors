@@ -23,7 +23,12 @@ VEC0_SO       = os.path.expanduser(os.getenv("VEC0_SO",
 EMBED_URL     = os.getenv("EMBED_URL", "http://127.0.0.1:8766/embed")
 QMD_COLL      = "rag-kb"
 TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
-PASSWORD      = os.getenv("RAG_PASSWORD", "changeme")
+PASSWORD        = os.getenv("RAG_PASSWORD", "changeme")
+WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "writer123")
+
+# ── Articles (writer uploads) ─────────────────────────────────────────────────
+ARTICLES_DIR      = DATA_DIR / "articles"
+ARTICLEMETA_PATH  = DATA_DIR / "articlemeta.json"
 
 # ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
@@ -39,6 +44,16 @@ def _load_filemeta():
 
 def _save_filemeta():
     FILEMETA_PATH.write_text(json.dumps(_filemeta, ensure_ascii=False, indent=2))
+
+# ── Article meta helpers ──────────────────────────────────────────────────────
+_articlemeta: List[dict] = []
+
+def _load_articlemeta():
+    global _articlemeta
+    _articlemeta = json.loads(ARTICLEMETA_PATH.read_text()) if ARTICLEMETA_PATH.exists() else []
+
+def _save_articlemeta():
+    ARTICLEMETA_PATH.write_text(json.dumps(_articlemeta, ensure_ascii=False, indent=2))
 
 def _all_categories() -> List[str]:
     """Return sorted unique category paths from filemeta."""
@@ -166,7 +181,9 @@ def _auth(token: Optional[str]) -> bool:
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
+    ARTICLES_DIR.mkdir(parents=True, exist_ok=True)
     _load_filemeta()
+    _load_articlemeta()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML helpers
@@ -258,6 +275,7 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
   <a href="/dashboard">Dashboard</a>
   <a href="/search_ui">搜尋</a>
   <a href="/grade_ui">📝 評分</a>
+  <a href="/articles">📰 文章庫</a>
   <a href="/logout" style="margin-left:auto">登出</a>
 </div>
 <div class="container">
@@ -1637,3 +1655,312 @@ async def regen_report(payload: dict):
         return {"report": report}
     except Exception as e:
         return {"error": str(e)}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Writer Portal — 寫手蝦投稿頁（獨立密碼）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_writer_sessions: set = set()
+
+def _auth_writer(token: Optional[str]) -> bool:
+    return token is not None and token in _writer_sessions
+
+def _writer_base_html(body: str, title="投稿平台") -> str:
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
+  .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:14px 32px;display:flex;align-items:center;gap:16px}}
+  .topbar h1{{font-size:1.1rem;font-weight:600;color:#34d399}}
+  .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none}}
+  .container{{max-width:760px;margin:40px auto;padding:0 24px}}
+  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:28px;margin-bottom:24px}}
+  .card h2{{font-size:1rem;font-weight:600;color:#34d399;margin-bottom:18px}}
+  label{{font-size:.85rem;color:#94a3b8;display:block;margin-bottom:6px}}
+  input[type=text],input[type=password],textarea{{
+    width:100%;padding:10px 14px;background:#0f1117;border:1px solid #2d3154;
+    border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;transition:.2s
+  }}
+  input:focus,textarea:focus{{border-color:#34d399}}
+  .btn{{display:inline-block;padding:10px 22px;background:#059669;color:#fff;
+    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s}}
+  .btn:hover{{background:#047857}}
+  .alert{{padding:12px 16px;border-radius:8px;font-size:.85rem;margin-bottom:16px}}
+  .alert-error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5}}
+  .alert-success{{background:#052e16;border:1px solid #14532d;color:#86efac}}
+  .hint{{font-size:.8rem;color:#4b5563;margin-top:6px}}
+  .filed-list{{list-style:none}}
+  .filed-list li{{border-bottom:1px solid #1e2235;padding:10px 0;font-size:.87rem;color:#94a3b8}}
+  .filed-list li:last-child{{border-bottom:none}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>✍️ 寫手投稿平台</h1>
+  <a href="/writer/logout" style="margin-left:auto">登出</a>
+</div>
+<div class="container">{body}</div>
+</body>
+</html>"""
+
+@app.get("/writer/login", response_class=HTMLResponse)
+def writer_login_page(error: str = ""):
+    err = '<div class="alert alert-error">密碼錯誤，請再試一次。</div>' if error else ""
+    body = f"""
+<div style="max-width:400px;margin:80px auto">
+<div class="card">
+  <h2>🔐 寫手登入</h2>{err}
+  <form method="post" action="/writer/login">
+    <label>投稿密碼</label>
+    <input type="password" name="password" autofocus style="margin-bottom:16px">
+    <button class="btn" type="submit" style="width:100%">登入</button>
+  </form>
+</div></div>"""
+    return HTMLResponse(_writer_base_html(body, "登入 — 寫手投稿"))
+
+@app.post("/writer/login")
+def writer_login(response: Response, password: str = Form(...)):
+    if not secrets.compare_digest(password, WRITER_PASSWORD):
+        return RedirectResponse("/writer/login?error=1", status_code=303)
+    token = secrets.token_urlsafe(32)
+    _writer_sessions.add(token)
+    resp = RedirectResponse("/writer", status_code=303)
+    resp.set_cookie("writer_token", token, httponly=True, samesite="lax", max_age=86400*7)
+    return resp
+
+@app.get("/writer/logout")
+def writer_logout(writer_token: Optional[str] = Cookie(None)):
+    _writer_sessions.discard(writer_token)
+    resp = RedirectResponse("/writer/login", status_code=303)
+    resp.delete_cookie("writer_token")
+    return resp
+
+@app.get("/writer", response_class=HTMLResponse)
+def writer_portal(writer_token: Optional[str] = Cookie(None), msg: str = ""):
+    if not _auth_writer(writer_token):
+        return RedirectResponse("/writer/login")
+
+    ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
+
+    # List this writer's recent uploads (last 10)
+    recent = list(reversed(_articlemeta))[:10]
+    items = "".join(
+        f'<li>📄 {a["title"]} <span style="color:#4b5563;font-size:.78rem">— {a["uploaded_at"]}</span></li>'
+        for a in recent
+    ) or "<li style='color:#4b5563'>尚無投稿記錄</li>"
+
+    body = f"""
+{ok_html}
+<div class="card">
+  <h2>📤 投稿文章</h2>
+  <p style="font-size:.85rem;color:#64748b;margin-bottom:18px">請上傳 Markdown (.md) 格式的文章，確認內容完整後再送出。</p>
+  <form method="post" action="/writer/submit" enctype="multipart/form-data">
+    <div style="margin-bottom:14px">
+      <label>文章標題</label>
+      <input type="text" name="title" placeholder="文章標題" required>
+    </div>
+    <div style="margin-bottom:14px">
+      <label>作者名稱</label>
+      <input type="text" name="author" placeholder="你的名字或筆名" required>
+    </div>
+    <div style="margin-bottom:14px">
+      <label>上傳 .md 檔案</label>
+      <input type="file" name="file" accept=".md,.txt" required>
+      <div class="hint">僅接受 .md / .txt 格式，建議使用 Markdown 撰寫</div>
+    </div>
+    <div style="margin-bottom:18px">
+      <label>備註（選填）</label>
+      <textarea name="note" rows="2" placeholder="給編輯的備註，例如：這篇是系列第二篇…"></textarea>
+    </div>
+    <button class="btn" type="submit">📨 送出投稿</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>📋 最近投稿</h2>
+  <ul class="filed-list">{items}</ul>
+</div>
+"""
+    return HTMLResponse(_writer_base_html(body))
+
+@app.post("/writer/submit")
+async def writer_submit(
+    writer_token: Optional[str] = Cookie(None),
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    author: str = Form(...),
+    note: str = Form(""),
+):
+    if not _auth_writer(writer_token):
+        return RedirectResponse("/writer/login")
+
+    raw = await file.read()
+    text = raw.decode("utf-8", errors="replace")
+
+    article_id = str(uuid.uuid4())
+    slug = re.sub(r"[^\w\-]", "-", title.lower())[:60]
+    filename = f"{slug}.md"
+    save_path = ARTICLES_DIR / f"{article_id}.md"
+    save_path.write_text(text, encoding="utf-8")
+
+    _articlemeta.append({
+        "id": article_id,
+        "title": title.strip(),
+        "author": author.strip(),
+        "note": note.strip(),
+        "filename": filename,
+        "size": len(raw),
+        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "path": str(save_path),
+    })
+    _save_articlemeta()
+
+    return RedirectResponse(
+        f"/writer?msg=投稿成功！《{title}》已送出，感謝你的貢獻 🎉",
+        status_code=303
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Articles — 文章庫（Owner 閱讀 / 下載）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/articles", response_class=HTMLResponse)
+def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+
+    ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
+    total = len(_articlemeta)
+
+    if _articlemeta:
+        rows = ""
+        for a in reversed(_articlemeta):
+            size_kb = a.get("size", 0) // 1024
+            rows += f"""<tr>
+  <td><a href="/articles/{a['id']}" style="color:#a78bfa;text-decoration:none">{a['title']}</a></td>
+  <td style="color:#94a3b8">{a.get('author','—')}</td>
+  <td style="color:#64748b;font-size:.8rem">{a.get('uploaded_at','')}</td>
+  <td style="color:#64748b;font-size:.8rem">{size_kb} KB</td>
+  <td>
+    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none;padding:5px 12px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:6px;font-size:.8rem">⬇ .md</a>
+    &nbsp;
+    <form method="post" action="/articles/{a['id']}/delete" style="display:inline"
+          onsubmit="return confirm('確定刪除？')">
+      <button style="padding:5px 10px;background:#dc2626;border:none;border-radius:6px;color:#fff;font-size:.8rem;cursor:pointer">🗑</button>
+    </form>
+  </td>
+</tr>"""
+        table = f"""<table>
+<thead><tr>
+  <th>標題</th><th>作者</th><th>投稿時間</th><th>大小</th><th>操作</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>"""
+    else:
+        table = '<div class="empty">尚無文章，請請寫手蝦投稿 😊</div>'
+
+    body = f"""
+{ok_html}
+<div class="stats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">
+  <div class="stat"><span class="stat-val">{total}</span> 篇文章</div>
+</div>
+<div class="card">
+  <h2>📰 文章庫</h2>
+  <p style="font-size:.82rem;color:#64748b;margin-bottom:16px">
+    寫手投稿頁：<a href="/writer/login" style="color:#34d399" target="_blank">/writer/login</a>
+    （可分享給寫手蝦，密碼另行告知）
+  </p>
+  {table}
+</div>
+"""
+    return HTMLResponse(_base_html(body, "文章庫 — RAG KB"))
+
+@app.get("/articles/{article_id}", response_class=HTMLResponse)
+def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404)
+    path = Path(am["path"])
+    content = path.read_text(encoding="utf-8") if path.exists() else "（檔案遺失）"
+
+    # Escape for JS string
+    content_escaped = json.dumps(content)
+
+    body = f"""
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px">
+    <div>
+      <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px">{am['title']}</h2>
+      <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+      {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
+    </div>
+    <div style="display:flex;gap:10px">
+      <a href="/articles/{article_id}/download"
+         style="padding:8px 16px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:8px;font-size:.85rem;text-decoration:none">
+        ⬇ 下載 .md
+      </a>
+      <a href="/articles" style="padding:8px 16px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:8px;font-size:.85rem;text-decoration:none">
+        ← 回列表
+      </a>
+    </div>
+  </div>
+
+  <div id="rendered" style="
+    line-height:1.8;color:#cbd5e1;
+    font-size:.95rem;
+  "></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+const md = {content_escaped};
+document.getElementById('rendered').innerHTML = marked.parse(md);
+</script>
+<style>
+  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em}}
+  #rendered p{{margin-bottom:.9em}}
+  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac}}
+  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em}}
+  #rendered pre code{{background:none;padding:0}}
+  #rendered blockquote{{border-left:3px solid #a78bfa;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
+  #rendered a{{color:#60a5fa}}
+  #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
+  #rendered img{{max-width:100%;border-radius:8px}}
+  #rendered hr{{border:none;border-top:1px solid #2d3154;margin:1.5em 0}}
+</style>
+"""
+    return HTMLResponse(_base_html(body, f"{am['title']} — 文章庫"))
+
+@app.get("/articles/{article_id}/download")
+def article_download(article_id: str, rag_token: Optional[str] = Cookie(None)):
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404)
+    path = Path(am["path"])
+    if not path.exists():
+        raise HTTPException(404, "File missing")
+    return FileResponse(str(path), filename=am["filename"], media_type="text/markdown")
+
+@app.post("/articles/{article_id}/delete")
+def article_delete(article_id: str, rag_token: Optional[str] = Cookie(None)):
+    global _articlemeta
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404)
+    p = Path(am["path"])
+    if p.exists():
+        p.unlink()
+    _articlemeta = [a for a in _articlemeta if a["id"] != article_id]
+    _save_articlemeta()
+    return RedirectResponse(f"/articles?msg=已刪除：{am['title']}", status_code=303)
