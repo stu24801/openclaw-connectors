@@ -7,7 +7,9 @@ import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, st
 import threading, queue, time
 from pathlib import Path
 from typing import List, Optional, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Cookie, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, StreamingResponse
@@ -563,7 +565,7 @@ async def upload_form(
         "source_name": name,
         "category": cat,
         "size": len(raw),
-        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "uploaded_at": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
         "ext": save_ext,
     })
@@ -767,7 +769,7 @@ async def upload_text_api(payload: dict):
         "source_name": source,
         "category": category,
         "size": len(text.encode()),
-        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "uploaded_at": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
         "ext": ".txt",
     })
@@ -960,7 +962,7 @@ async def grade_api(payload: dict):
 ## 基本資訊
 - Repo: {repo_url}
 - 分支: {branch}
-- 評分時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+- 評分時間: {datetime.now(TZ_TAIPEI).strftime('%Y-%m-%d %H:%M')}
 
 ## 🎯 題目判定
 （說明對應哪一題及判斷依據）
@@ -1081,7 +1083,7 @@ async def grade_stream(repo_url: str, token: str = ""):
 ## 基本資訊
 - Repo: {repo_url}
 - 分支: {branch}
-- 評分時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+- 評分時間: {datetime.now(TZ_TAIPEI).strftime('%Y-%m-%d %H:%M')}
 
 ## 🎯 題目判定
 （說明對應哪一題及判斷依據）
@@ -1800,7 +1802,7 @@ async def writer_api_submit(request: Request):
         "note": note,
         "filename": filename,
         "size": len(content.encode()),
-        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "uploaded_at": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
     })
     _save_articlemeta()
@@ -1914,7 +1916,7 @@ async def writer_submit(
         "note": note.strip(),
         "filename": filename,
         "size": len(raw),
-        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "uploaded_at": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
         "path": str(save_path),
     })
     _save_articlemeta()
