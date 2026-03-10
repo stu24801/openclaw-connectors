@@ -193,24 +193,21 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
     # Build sidebar category links
     sidebar_html = ""
     if sidebar_cats is not None:
-        links = '<a href="/dashboard" style="color:#94a3b8;text-decoration:none;display:block;padding:6px 8px;border-radius:6px;font-size:.82rem">📋 全部文件</a>'
+        links = '<a href="/dashboard" style="color:#94a3b8;text-decoration:none;display:block;padding:6px 8px;border-radius:6px;font-size:.82rem;min-height:44px;display:flex;align-items:center">📋 全部文件</a>'
         for cat in sidebar_cats:
             depth = cat.count("/")
             indent = depth * 14
             label = cat.split("/")[-1]
-            links += f'<a href="/dashboard?cat={cat}" style="color:#94a3b8;text-decoration:none;display:block;padding:5px 8px 5px {8+indent}px;border-radius:6px;font-size:.82rem">{"  " * depth}📁 {label}</a>'
+            links += f'<a href="/dashboard?cat={cat}" style="color:#94a3b8;text-decoration:none;display:flex;align-items:center;padding:5px 8px 5px {8+indent}px;border-radius:6px;font-size:.82rem;min-height:40px">{"  " * depth}📁 {label}</a>'
         sidebar_html = f"""
-<div style="width:200px;flex-shrink:0">
+<div class="sidebar-panel">
   <div style="background:#1a1d2e;border:1px solid #2d3154;border-radius:10px;padding:14px">
     <div style="color:#64748b;font-size:.75rem;font-weight:600;margin-bottom:10px;letter-spacing:.05em">分類</div>
     {links}
   </div>
 </div>"""
-
-    layout_start = '<div style="display:flex;gap:24px;align-items:flex-start">' if sidebar_cats is not None else ""
-    layout_end   = "</div>" if sidebar_cats is not None else ""
-    content_wrap_start = '<div style="flex:1;min-width:0">' if sidebar_cats is not None else ""
-    content_wrap_end   = "</div>" if sidebar_cats is not None else ""
+    else:
+        sidebar_html = ""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -220,43 +217,48 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
-  .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:14px 32px;display:flex;align-items:center;gap:16px}}
-  .topbar h1{{font-size:1.1rem;font-weight:600;color:#a78bfa}}
-  .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none}}
+  .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+  .topbar h1{{font-size:1.1rem;font-weight:600;color:#a78bfa;flex-shrink:0}}
+  .topbar-nav{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;flex:1}}
+  .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none;min-height:44px;display:inline-flex;align-items:center;padding:0 4px}}
   .topbar a:hover{{color:#a78bfa}}
   .topbar a.active{{color:#a78bfa;border-bottom:2px solid #a78bfa;padding-bottom:2px}}
-  .container{{max-width:1100px;margin:40px auto;padding:0 24px}}
-  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:28px;margin-bottom:24px}}
+  .topbar-logout{{margin-left:auto}}
+  .hamburger{{display:none;background:none;border:none;color:#94a3b8;font-size:1.4rem;cursor:pointer;padding:4px 8px;min-height:44px;min-width:44px;align-items:center;justify-content:center}}
+  .sidebar-toggle-btn{{display:none;width:100%;background:#2d3154;border:none;color:#94a3b8;padding:10px;border-radius:8px;cursor:pointer;font-size:.85rem;margin-bottom:10px;min-height:44px}}
+  .container{{max-width:1100px;margin:32px auto;padding:0 16px}}
+  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:24px;margin-bottom:24px}}
   .card h2{{font-size:1rem;font-weight:600;color:#a78bfa;margin-bottom:18px;display:flex;align-items:center;gap:8px}}
-  label{{font-size:.85rem;color:#94a3b8;display:block;margin-bottom:6px}}
-  input[type=text],input[type=password],input[type=file],select{{
-    width:100%;padding:10px 14px;background:#0f1117;border:1px solid #2d3154;
-    border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;transition:.2s
+  label{{font-size:.9rem;color:#94a3b8;display:block;margin-bottom:6px}}
+  input[type=text],input[type=password],input[type=file],select,textarea{{
+    width:100%;padding:12px 14px;background:#0f1117;border:1px solid #2d3154;
+    border-radius:8px;color:#e2e8f0;font-size:16px;outline:none;transition:.2s
   }}
   select option{{background:#1a1d2e}}
-  input:focus,select:focus{{border-color:#a78bfa}}
-  .btn{{display:inline-block;padding:10px 22px;background:#7c3aed;color:#fff;
-    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s}}
+  input:focus,select:focus,textarea:focus{{border-color:#a78bfa}}
+  .btn{{display:inline-flex;align-items:center;justify-content:center;padding:12px 22px;background:#7c3aed;color:#fff;
+    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s;min-height:44px;min-width:44px}}
   .btn:hover{{background:#6d28d9}}
-  .btn-sm{{padding:6px 14px;font-size:.8rem;border-radius:6px}}
+  .btn-sm{{padding:8px 14px;font-size:.82rem;border-radius:6px;min-height:44px}}
   .btn-danger{{background:#dc2626}}.btn-danger:hover{{background:#b91c1c}}
   .btn-ghost{{background:transparent;border:1px solid #374151;color:#94a3b8}}
   .btn-ghost:hover{{background:#1f2937;color:#e2e8f0}}
   .alert{{padding:12px 16px;border-radius:8px;font-size:.85rem;margin-bottom:16px}}
   .alert-error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5}}
   .alert-success{{background:#052e16;border:1px solid #14532d;color:#86efac}}
-  table{{width:100%;border-collapse:collapse;font-size:.85rem}}
+  .table-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  table{{width:100%;border-collapse:collapse;font-size:.85rem;min-width:480px}}
   th{{text-align:left;padding:10px 12px;background:#0f1117;color:#64748b;font-weight:500;border-bottom:1px solid #2d3154}}
   td{{padding:10px 12px;border-bottom:1px solid #1e2235;vertical-align:middle}}
   tr:last-child td{{border-bottom:none}}
   tr:hover td{{background:#1e2235}}
-  .badge{{display:inline-block;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:500}}
+  .badge{{display:inline-block;padding:3px 8px;border-radius:99px;font-size:.75rem;font-weight:500}}
   .badge-purple{{background:#3b0764;color:#c4b5fd}}
   .badge-blue{{background:#1e3a5f;color:#93c5fd}}
   .badge-green{{background:#052e16;color:#86efac}}
   .empty{{color:#4b5563;text-align:center;padding:32px;font-size:.9rem}}
-  .form-row{{display:flex;gap:12px;align-items:flex-end}}
-  .form-row>*{{flex:1}}
+  .form-row{{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}}
+  .form-row>*{{flex:1;min-width:140px}}
   .form-row .btn{{flex:0 0 auto}}
   .stat{{display:inline-flex;align-items:center;gap:6px;background:#0f1117;
     border:1px solid #2d3154;border-radius:8px;padding:8px 16px;font-size:.85rem}}
@@ -267,25 +269,90 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
   @keyframes spin{{ to{{transform:rotate(360deg)}} }}
   .spinner{{width:40px;height:40px;margin:0 auto;border:3px solid #2d3154;
     border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite}}
+  /* Sidebar panel */
+  .sidebar-panel{{width:200px;flex-shrink:0}}
+  /* Upload grid */
+  .upload-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px}}
+  /* Search grid */
+  .search-grid{{display:grid;grid-template-columns:1fr auto auto;gap:12px;margin-bottom:20px;align-items:end}}
+  /* Grade grid */
+  .grade-grid{{display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:14px;align-items:end}}
+  /* ── Mobile ── */
+  @media (max-width:640px){{
+    .topbar{{padding:10px 14px;gap:8px}}
+    .topbar h1{{font-size:1rem}}
+    .topbar-nav a{{font-size:.8rem;padding:0 2px}}
+    .container{{padding:0 12px;margin:16px auto}}
+    .card{{padding:16px;border-radius:10px}}
+    /* Sidebar becomes collapsible */
+    .sidebar-panel{{width:100% !important;margin-bottom:12px}}
+    .sidebar-panel>div{{border-radius:8px}}
+    /* Layout becomes vertical */
+    .layout-flex{{flex-direction:column !important}}
+    /* Content area no min-width */
+    .content-wrap{{min-width:0 !important}}
+    /* Upload form → single column */
+    .upload-grid{{grid-template-columns:1fr !important}}
+    /* Search inputs → stacked */
+    .search-grid{{grid-template-columns:1fr !important}}
+    .search-grid select{{width:100% !important}}
+    /* Grade inputs → stacked */
+    .grade-grid{{grid-template-columns:1fr !important}}
+    .grade-grid input{{width:100% !important}}
+    /* Tables: horizontal scroll */
+    table{{min-width:500px}}
+    .table-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}}
+    /* Stats wrap */
+    .stats{{gap:8px}}
+    .stat{{font-size:.8rem;padding:6px 10px}}
+    /* Buttons in action cells */
+    td .btn-sm{{min-height:40px;min-width:40px}}
+    /* Article view */
+    #rendered{{font-size:.9rem;line-height:1.7}}
+    /* Chat input */
+    #chat-input{{font-size:16px}}
+    /* Prompt box */
+    #prompt-box{{font-size:.75rem}}
+    /* Progress log */
+    #progress-log{{font-size:.78rem}}
+    /* Form rows */
+    .form-row{{flex-direction:column}}
+    .form-row>*{{min-width:unset}}
+    /* Topbar logout push */
+    .topbar-logout{{margin-left:0}}
+  }}
 </style>
 </head>
 <body>
 <div class="topbar">
   <h1>🦐 RAG Knowledge Base</h1>
-  <a href="/dashboard">Dashboard</a>
-  <a href="/search_ui">搜尋</a>
-  <a href="/grade_ui">📝 評分</a>
-  <a href="/articles">📰 文章庫</a>
-  <a href="/logout" style="margin-left:auto">登出</a>
+  <div class="topbar-nav">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/search_ui">搜尋</a>
+    <a href="/grade_ui">📝 評分</a>
+    <a href="/articles">📰 文章庫</a>
+    <a href="/logout" class="topbar-logout">登出</a>
+  </div>
 </div>
 <div class="container">
-  {layout_start}
+  <div class="layout-flex" style="display:flex;gap:24px;align-items:flex-start">
   {sidebar_html}
-  {content_wrap_start}
+  <div class="content-wrap" style="flex:1;min-width:0">
   {body}
-  {content_wrap_end}
-  {layout_end}
+  </div>
+  </div>
 </div>
+<script>
+// Wrap all tables in scroll containers
+document.querySelectorAll('table').forEach(function(t){{
+  if(t.parentElement && !t.parentElement.classList.contains('table-wrap')){{
+    var w=document.createElement('div');
+    w.className='table-wrap';
+    t.parentNode.insertBefore(w,t);
+    w.appendChild(t);
+  }}
+}});
+</script>
 </body>
 </html>"""
 
@@ -396,7 +463,7 @@ def dashboard(rag_token: Optional[str] = Cookie(None), msg: str = "", cat: str =
 <div class="card">
   <h2>📤 上傳文件</h2>
   <form method="post" action="/upload_form" enctype="multipart/form-data" onsubmit="showUploadLoading(this)">
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px" class="upload-grid">
       <div>
         <label>選擇檔案（.txt / .md / .pdf）</label>
         <input type="file" name="file" accept=".txt,.md,.pdf" required>
@@ -561,7 +628,7 @@ def search_ui(q: str = "", category: str = "", rag_token: Optional[str] = Cookie
     body = f"""
 <div class="card">
   <h2>🔍 語意搜尋</h2>
-  <div style="display:grid;grid-template-columns:1fr auto auto;gap:12px;margin-bottom:20px;align-items:end">
+  <div style="display:grid;grid-template-columns:1fr auto auto;gap:12px;margin-bottom:20px;align-items:end" class="search-grid">
     <div>
       <label>查詢關鍵字</label>
       <input type="text" id="search-input" value="{q}" placeholder="輸入查詢關鍵字…" autofocus
@@ -1081,7 +1148,7 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
   </div>
 
   <!-- 輸入 -->
-  <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:14px;align-items:end">
+  <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:14px;align-items:end" class="grade-grid">
     <div>
       <label>GitHub Repo URL</label>
       <input type="text" id="repo-url" placeholder="https://github.com/owner/repo/tree/main">
@@ -1674,20 +1741,20 @@ def _writer_base_html(body: str, title="投稿平台") -> str:
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
-  .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:14px 32px;display:flex;align-items:center;gap:16px}}
+  .topbar{{background:#1a1d2e;border-bottom:1px solid #2d3154;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
   .topbar h1{{font-size:1.1rem;font-weight:600;color:#34d399}}
-  .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none}}
-  .container{{max-width:760px;margin:40px auto;padding:0 24px}}
-  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:28px;margin-bottom:24px}}
+  .topbar a{{color:#94a3b8;font-size:.85rem;text-decoration:none;min-height:44px;display:inline-flex;align-items:center}}
+  .container{{max-width:760px;margin:32px auto;padding:0 16px}}
+  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:24px;margin-bottom:24px}}
   .card h2{{font-size:1rem;font-weight:600;color:#34d399;margin-bottom:18px}}
-  label{{font-size:.85rem;color:#94a3b8;display:block;margin-bottom:6px}}
+  label{{font-size:.9rem;color:#94a3b8;display:block;margin-bottom:6px}}
   input[type=text],input[type=password],textarea{{
-    width:100%;padding:10px 14px;background:#0f1117;border:1px solid #2d3154;
-    border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;transition:.2s
+    width:100%;padding:12px 14px;background:#0f1117;border:1px solid #2d3154;
+    border-radius:8px;color:#e2e8f0;font-size:16px;outline:none;transition:.2s
   }}
   input:focus,textarea:focus{{border-color:#34d399}}
-  .btn{{display:inline-block;padding:10px 22px;background:#059669;color:#fff;
-    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s}}
+  .btn{{display:inline-flex;align-items:center;justify-content:center;padding:12px 22px;background:#059669;color:#fff;
+    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s;min-height:44px}}
   .btn:hover{{background:#047857}}
   .alert{{padding:12px 16px;border-radius:8px;font-size:.85rem;margin-bottom:16px}}
   .alert-error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5}}
@@ -1872,28 +1939,58 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
 
     if _articlemeta:
         rows = ""
+        cards = ""
         for a in reversed(_articlemeta):
             size_kb = a.get("size", 0) // 1024
+            # Desktop table row
             rows += f"""<tr>
   <td><a href="/articles/{a['id']}" style="color:#a78bfa;text-decoration:none">{a['title']}</a></td>
   <td style="color:#94a3b8">{a.get('author','—')}</td>
   <td style="color:#64748b;font-size:.8rem">{a.get('uploaded_at','')}</td>
   <td style="color:#64748b;font-size:.8rem">{size_kb} KB</td>
-  <td>
-    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none;padding:5px 12px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:6px;font-size:.8rem">⬇ .md</a>
+  <td style="white-space:nowrap">
+    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
     &nbsp;
     <form method="post" action="/articles/{a['id']}/delete" style="display:inline"
           onsubmit="return confirm('確定刪除？')">
-      <button style="padding:5px 10px;background:#dc2626;border:none;border-radius:6px;color:#fff;font-size:.8rem;cursor:pointer">🗑</button>
+      <button class="btn btn-sm btn-danger">🗑</button>
     </form>
   </td>
 </tr>"""
-        table = f"""<table>
+            # Mobile card
+            cards += f"""<div class="article-card">
+  <a href="/articles/{a['id']}" class="article-card-title">{a['title']}</a>
+  <div class="article-card-meta">✍️ {a.get('author','—')} &nbsp;·&nbsp; {a.get('uploaded_at','')} &nbsp;·&nbsp; {size_kb} KB</div>
+  <div class="article-card-actions">
+    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
+    <form method="post" action="/articles/{a['id']}/delete"
+          onsubmit="return confirm('確定刪除？')">
+      <button class="btn btn-sm btn-danger">🗑 刪除</button>
+    </form>
+  </div>
+</div>"""
+        table = f"""
+<style>
+  .article-card{{border:1px solid #2d3154;border-radius:10px;padding:14px 16px;margin-bottom:10px;background:#0f1117}}
+  .article-card-title{{color:#a78bfa;font-size:1rem;font-weight:500;text-decoration:none;display:block;margin-bottom:6px;word-break:break-word}}
+  .article-card-meta{{font-size:.78rem;color:#64748b;margin-bottom:10px}}
+  .article-card-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+  .article-cards{{display:none}}
+  .article-table{{display:block}}
+  @media(max-width:640px){{
+    .article-cards{{display:block}}
+    .article-table{{display:none}}
+  }}
+</style>
+<div class="article-cards">{cards}</div>
+<div class="article-table">
+<div class="table-wrap"><table>
 <thead><tr>
   <th>標題</th><th>作者</th><th>投稿時間</th><th>大小</th><th>操作</th>
 </tr></thead>
 <tbody>{rows}</tbody>
-</table>"""
+</table></div>
+</div>"""
     else:
         table = '<div class="empty">尚無文章，請請寫手蝦投稿 😊</div>'
 
@@ -1929,17 +2026,16 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
     body = f"""
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px">
-    <div>
-      <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px">{am['title']}</h2>
+    <div style="min-width:0;flex:1">
+      <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
       <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
       {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
     </div>
-    <div style="display:flex;gap:10px">
-      <a href="/articles/{article_id}/download"
-         style="padding:8px 16px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:8px;font-size:.85rem;text-decoration:none">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
+      <a href="/articles/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">
         ⬇ 下載 .md
       </a>
-      <a href="/articles" style="padding:8px 16px;background:transparent;border:1px solid #374151;color:#94a3b8;border-radius:8px;font-size:.85rem;text-decoration:none">
+      <a href="/articles" class="btn btn-sm btn-ghost" style="text-decoration:none">
         ← 回列表
       </a>
     </div>
@@ -1948,6 +2044,10 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
   <div id="rendered" style="
     line-height:1.8;color:#cbd5e1;
     font-size:.95rem;
+    max-width:100%;
+    overflow:hidden;
+    word-break:break-word;
+    overflow-wrap:break-word;
   "></div>
 </div>
 
@@ -1955,18 +2055,41 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
 <script>
 const md = {content_escaped};
 document.getElementById('rendered').innerHTML = marked.parse(md);
+// Wrap all tables in scroll containers
+document.querySelectorAll('#rendered table').forEach(function(t){{
+  if(!t.parentElement.classList.contains('table-wrap')){{
+    var w=document.createElement('div');
+    w.className='table-wrap';
+    w.style.overflowX='auto';
+    w.style.webkitOverflowScrolling='touch';
+    w.style.maxWidth='100%';
+    t.parentNode.insertBefore(w,t);
+    w.appendChild(t);
+  }}
+}});
+// Wrap all pre in scroll containers
+document.querySelectorAll('#rendered pre').forEach(function(p){{
+  p.style.maxWidth='100%';
+  p.style.overflowX='auto';
+  p.style.boxSizing='border-box';
+}});
 </script>
 <style>
-  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em}}
+  #rendered{{max-width:100%;overflow-x:hidden;word-break:break-word;overflow-wrap:break-word}}
+  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em;word-break:break-word}}
   #rendered p{{margin-bottom:.9em}}
-  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac}}
-  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em}}
-  #rendered pre code{{background:none;padding:0}}
+  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac;word-break:break-all}}
+  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em;max-width:100%}}
+  #rendered pre code{{background:none;padding:0;word-break:normal}}
   #rendered blockquote{{border-left:3px solid #a78bfa;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
-  #rendered a{{color:#60a5fa}}
+  #rendered a{{color:#60a5fa;word-break:break-all}}
   #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
-  #rendered img{{max-width:100%;border-radius:8px}}
+  #rendered img{{max-width:100%;height:auto;border-radius:8px;display:block}}
   #rendered hr{{border:none;border-top:1px solid #2d3154;margin:1.5em 0}}
+  #rendered table{{width:100%;border-collapse:collapse;font-size:.85rem;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  #rendered th{{text-align:left;padding:8px 10px;background:#0f1117;color:#64748b;border-bottom:1px solid #2d3154}}
+  #rendered td{{padding:8px 10px;border-bottom:1px solid #1e2235;vertical-align:top}}
+  .card{{overflow:hidden}}
 </style>
 """
     return HTMLResponse(_base_html(body, f"{am['title']} — 文章庫"))
