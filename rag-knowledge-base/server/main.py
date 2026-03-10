@@ -1707,7 +1707,40 @@ def _writer_base_html(body: str, title="投稿平台") -> str:
 </body>
 </html>"""
 
-@app.get("/writer/login", response_class=HTMLResponse)
+@app.post("/writer/api/submit")
+async def writer_api_submit(request: Request):
+    """API endpoint for writer skill to submit articles directly."""
+    x_token = request.headers.get("X-Writer-Token", "")
+    if not secrets.compare_digest(x_token, WRITER_PASSWORD):
+        raise HTTPException(401, "Invalid writer token")
+    payload = await request.json()
+    title   = (payload.get("title") or "").strip()
+    author  = (payload.get("author") or "").strip()
+    content = (payload.get("content") or "").strip()
+    note    = (payload.get("note") or "").strip()
+    if not title or not author or not content:
+        raise HTTPException(400, "title, author, content are required")
+
+    article_id = str(uuid.uuid4())
+    slug = re.sub(r"[^\w\-]", "-", title.lower())[:60]
+    filename = f"{slug}.md"
+    save_path = ARTICLES_DIR / f"{article_id}.md"
+    save_path.write_text(content, encoding="utf-8")
+    _articlemeta.append({
+        "id": article_id,
+        "title": title,
+        "author": author,
+        "note": note,
+        "filename": filename,
+        "size": len(content.encode()),
+        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "path": str(save_path),
+    })
+    _save_articlemeta()
+    return {"status": "ok", "article_id": article_id, "title": title}
+
+
+
 def writer_login_page(error: str = ""):
     err = '<div class="alert alert-error">密碼錯誤，請再試一次。</div>' if error else ""
     body = f"""
