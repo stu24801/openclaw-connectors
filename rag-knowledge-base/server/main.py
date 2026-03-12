@@ -187,16 +187,23 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K, category: Optional[str] = No
 
 def _notify_writer(article_title: str, article_id: str, owner_message: str) -> bool:
     """Send feedback notification to 寫手蝦 via OpenClaw Gateway sessions_send."""
-    article_url = f"https://rag.alex-stu24801.com/writer/article/{article_id}"
+    post_reply_cmd = (
+        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages "
+        f"-H 'Content-Type: application/json' "
+        f"-H 'X-Writer-Token: writer123' "
+        f"-d '{{\"role\":\"writer\",\"from\":\"寫手蝦\",\"content\":\"你的回覆內容\"}}'"
+    )
     payload = {
         "tool": "sessions_send",
         "args": {
             "sessionKey": WRITER_SESSION_KEY,
             "message": (
-                f"📬 **景揚對文章留下了回饋**\n\n"
+                f"📬 **景揚對文章留下了回饋，請你閱讀並回覆**\n\n"
                 f"📄 文章：**{article_title}**\n"
-                f"💬 內容：{owner_message}\n\n"
-                f"👉 前往查看並回覆：{article_url}"
+                f"💬 景揚的回饋：{owner_message}\n\n"
+                f"請使用 rag-article-feedback skill 處理，並用以下 API 把回覆寫進對話視窗：\n\n"
+                f"```bash\n{post_reply_cmd}\n```\n\n"
+                f"article_id: `{article_id}`"
             )
         }
     }
@@ -2445,10 +2452,12 @@ def get_article_messages(article_id: str, rag_token: Optional[str] = Cookie(None
     return {"article_id": article_id, "messages": msgs}
 
 @app.post("/articles/{article_id}/messages")
-async def post_article_message(article_id: str, payload: dict, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
-    """Post a message. Owner uses rag_token, writer uses writer_token."""
+async def post_article_message(article_id: str, payload: dict, request: Request, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
+    """Post a message. Owner uses rag_token, writer uses writer_token cookie or X-Writer-Token header."""
     is_owner  = _auth(rag_token)
-    is_writer = _auth_writer(writer_token)
+    # 支援 header token 讓寫手蝦不需 cookie
+    x_writer = request.headers.get("X-Writer-Token", "")
+    is_writer = _auth_writer(writer_token) or (x_writer and secrets.compare_digest(x_writer, WRITER_PASSWORD))
     if not is_owner and not is_writer:
         raise HTTPException(401, "Not authenticated")
 
