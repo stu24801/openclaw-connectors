@@ -3,7 +3,8 @@ RAG Knowledge Base Server — QMD SQLite direct + embed_server (port 8766)
 v2: 支援分層分類 (category) 管理與搜尋過濾
 """
 
-import os, uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, struct, urllib.request
+import os
+import uuid, json, hashlib, secrets, io, subprocess, shutil, re, sqlite3, struct, urllib.request
 import threading, queue, time
 from pathlib import Path
 from typing import List, Optional, AsyncGenerator
@@ -2077,6 +2078,8 @@ def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(No
     <div style="min-width:0;flex:1">
       <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
       <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+      {version_select_html}
+      {version_select_html}
     </div>
     <a href="/writer" class="btn btn-sm btn-ghost" style="text-decoration:none;flex-shrink:0">← 返回</a>
   </div>
@@ -2159,8 +2162,7 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}}
-setInterval(loadMessages, 5000););
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2194,6 +2196,7 @@ async function sendReply(){{
 }}
 
 loadMessages();
+setInterval(loadMessages, 5000);
 </script>
 <style>
   #rendered h1,#rendered h2,#rendered h3{{color:#34d399;margin:1.2em 0 .5em}}
@@ -2332,14 +2335,44 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
     return HTMLResponse(_base_html(body, "文章庫 — RAG KB"))
 
 @app.get("/articles/{article_id}", response_class=HTMLResponse)
-def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
+def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
     am = next((a for a in _articlemeta if a["id"] == article_id), None)
     if not am:
         raise HTTPException(404)
+
+    versions = am.get("versions", [])
+    if not versions:
+        am["versions"] = [{"id": "v1", "timestamp": am.get("uploaded_at"), "path": am.get("path")}]
+        versions = am["versions"]
+        
     path = Path(am["path"])
+    selected_ver = next((x for x in versions if x["id"] == v), None) if v else None
+    if selected_ver:
+        path = Path(selected_ver["path"])
+
     content = path.read_text(encoding="utf-8") if path.exists() else "（檔案遺失）"
+
+
+
+    version_select_html = ""
+    if len(versions) > 1:
+        options = []
+        for ver in reversed(versions):
+            selected = "selected" if (v == ver["id"]) or (not v and ver["path"] == am["path"]) else ""
+            label = f"版本 {ver['id']} ({ver['timestamp']})"
+            options.append(f'<option value="{ver["id"]}" {selected}>{label}</option>')
+        
+        prefix = "/writer/article" if "msg" in locals() else "/articles"
+        version_select_html = f'''
+        <div style="margin-top:8px">
+          <select onchange="window.location.href='{prefix}/{article_id}?v=' + this.value" 
+                  style="background:#1e2235;color:#e2e8f0;border:1px solid #2d3154;padding:4px 8px;border-radius:4px;font-size:0.85rem;cursor:pointer">
+            {''.join(options)}
+          </select>
+        </div>
+        '''
 
     # Escape for JS string
     content_escaped = json.dumps(content)
@@ -2351,6 +2384,8 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
     <div style="min-width:0;flex:1">
       <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
       <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+      {version_select_html}
+      {version_select_html}
       {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
@@ -2447,8 +2482,7 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}}
-setInterval(loadMessages, 5000););
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2482,6 +2516,7 @@ async function sendFeedback(){{
 }}
 
 loadMessages();
+setInterval(loadMessages, 5000);
 </script>
 <style>
   #rendered{{max-width:100%;overflow-x:hidden;word-break:break-word;overflow-wrap:break-word}}
