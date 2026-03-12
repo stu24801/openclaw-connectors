@@ -35,6 +35,17 @@ ARTICLEMETA_PATH  = DATA_DIR / "articlemeta.json"
 # ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
 
+# ── Article messages (feedback) ───────────────────────────────────────────────
+ARTICLE_MESSAGES_PATH = DATA_DIR / "article_messages.json"
+_article_messages: dict = {}  # article_id → List[{role, from, content, timestamp}]
+
+def _load_article_messages():
+    global _article_messages
+    _article_messages = json.loads(ARTICLE_MESSAGES_PATH.read_text()) if ARTICLE_MESSAGES_PATH.exists() else {}
+
+def _save_article_messages():
+    ARTICLE_MESSAGES_PATH.write_text(json.dumps(_article_messages, ensure_ascii=False, indent=2))
+
 app = FastAPI(title="RAG Knowledge Base")
 
 # ── Filemeta helpers ──────────────────────────────────────────────────────────
@@ -186,6 +197,7 @@ def startup():
     ARTICLES_DIR.mkdir(parents=True, exist_ok=True)
     _load_filemeta()
     _load_articlemeta()
+    _load_article_messages()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML helpers
@@ -1810,6 +1822,7 @@ async def writer_api_submit(request: Request):
 
 
 
+@app.get("/writer/login", response_class=HTMLResponse)
 def writer_login_page(error: str = ""):
     err = '<div class="alert alert-error">密碼錯誤，請再試一次。</div>' if error else ""
     body = f"""
@@ -1850,10 +1863,25 @@ def writer_portal(writer_token: Optional[str] = Cookie(None), msg: str = ""):
 
     # List this writer's recent uploads (last 10)
     recent = list(reversed(_articlemeta))[:10]
-    items = "".join(
-        f'<li>📄 {a["title"]} <span style="color:#4b5563;font-size:.78rem">— {a["uploaded_at"]}</span></li>'
-        for a in recent
-    ) or "<li style='color:#4b5563'>尚無投稿記錄</li>"
+
+    # Build article cards with unread indicator
+    cards = ""
+    for a in recent:
+        size_kb = a.get("size", 0) // 1024
+        msgs = _article_messages.get(a["id"], [])
+        owner_msgs = [m for m in msgs if m["role"] == "owner"]
+        badge = f'<span style="background:#7c3aed;color:#fff;border-radius:99px;padding:2px 8px;font-size:.72rem;margin-left:6px">💬 {len(owner_msgs)} 則回饋</span>' if owner_msgs else ""
+        revised = f'<div style="font-size:.75rem;color:#34d399;margin-top:2px">✅ 已修改：{a["revised_at"]}</div>' if a.get("revised_at") else ""
+        cards += f"""<div style="border:1px solid #2d3154;border-radius:10px;padding:14px 16px;margin-bottom:10px;background:#0f1117">
+  <a href="/writer/article/{a['id']}" style="color:#34d399;font-size:1rem;font-weight:500;text-decoration:none;display:block;margin-bottom:4px;word-break:break-word">
+    {a['title']} {badge}
+  </a>
+  <div style="font-size:.78rem;color:#64748b">✍️ {a.get('author','—')} &nbsp;·&nbsp; {a.get('uploaded_at','')} &nbsp;·&nbsp; {size_kb} KB</div>
+  {revised}
+</div>"""
+
+    if not cards:
+        cards = '<div class="empty">尚無投稿記錄</div>'
 
     body = f"""
 {ok_html}
@@ -1883,11 +1911,162 @@ def writer_portal(writer_token: Optional[str] = Cookie(None), msg: str = ""):
 </div>
 
 <div class="card">
-  <h2>📋 最近投稿</h2>
-  <ul class="filed-list">{items}</ul>
+  <h2>📋 我的文章</h2>
+  <p style="font-size:.82rem;color:#64748b;margin-bottom:14px">點擊文章可查看景揚的回饋並回覆、提交修改版</p>
+  {cards}
 </div>
 """
     return HTMLResponse(_writer_base_html(body))
+
+
+@app.get("/writer/article/{article_id}", response_class=HTMLResponse)
+def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(None), msg: str = ""):
+    """Writer views an article, sees owner feedback, can reply and submit revision."""
+    if not _auth_writer(writer_token):
+        return RedirectResponse("/writer/login")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404)
+
+    ok_html = f'<div class="alert alert-success">✅ {msg}</div>' if msg else ""
+    content = Path(am["path"]).read_text(encoding="utf-8") if Path(am["path"]).exists() else "（檔案遺失）"
+    content_escaped = json.dumps(content)
+    article_id_json = json.dumps(article_id)
+    author_json = json.dumps(am.get("author", "寫手蝦"))
+
+    body = f"""
+{ok_html}
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px">
+    <div style="min-width:0;flex:1">
+      <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
+      <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+    </div>
+    <a href="/writer" class="btn btn-sm btn-ghost" style="text-decoration:none;flex-shrink:0">← 返回</a>
+  </div>
+  <div id="rendered" style="line-height:1.8;color:#cbd5e1;font-size:.95rem;max-width:100%;overflow:hidden;word-break:break-word"></div>
+</div>
+
+<!-- ── 回饋對話視窗 ────────────────────────────────────────────────── -->
+<div class="card">
+  <h2>💬 景揚的回饋 & 你的回覆</h2>
+  <div id="msg-list" style="
+    background:#0a0a0f;border:1px solid #1e2235;border-radius:10px;
+    padding:14px;min-height:80px;max-height:500px;overflow-y:auto;
+    margin-bottom:14px;font-size:.87rem;line-height:1.65
+  ">
+    <div id="msg-loading" style="color:#4b5563;text-align:center;padding:16px">載入中…</div>
+  </div>
+  <div style="display:flex;gap:10px;align-items:flex-end">
+    <textarea id="reply-input" rows="2" placeholder="輸入回覆，例如：收到！我會調整第二段的邏輯…"
+      style="flex:1;resize:vertical;min-height:60px;font-family:inherit;font-size:.87rem"
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendReply();}}">
+    </textarea>
+    <button class="btn" id="reply-btn" onclick="sendReply()" style="background:#059669;white-space:nowrap">
+      ➤ 回覆
+    </button>
+  </div>
+  <div style="font-size:.75rem;color:#475569;margin-top:6px">Enter 送出 ｜ Shift+Enter 換行</div>
+</div>
+
+<!-- ── 提交修改版 ──────────────────────────────────────────────────── -->
+<div class="card">
+  <h2>📝 提交修改版</h2>
+  <p style="font-size:.82rem;color:#64748b;margin-bottom:16px">
+    根據回饋修改文章後，上傳新版本 .md 檔案，系統會自動更新並通知景揚。
+  </p>
+  <form method="post" action="/articles/{article_id}/revise" enctype="multipart/form-data">
+    <input type="hidden" name="article_id" value="{article_id}">
+    <div style="margin-bottom:14px">
+      <label>修改後的 .md 檔案</label>
+      <input type="file" name="file" accept=".md,.txt" required>
+    </div>
+    <div style="margin-bottom:16px">
+      <label>修改說明</label>
+      <textarea name="note" rows="2" placeholder="說明這次修改了什麼，例如：依照回饋修正第二、三段邏輯…" style="font-family:inherit"></textarea>
+    </div>
+    <button class="btn" type="submit" style="background:#059669">📨 送出修改版</button>
+  </form>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+const md = {content_escaped};
+const ARTICLE_ID = {article_id_json};
+const AUTHOR = {author_json};
+document.getElementById('rendered').innerHTML = marked.parse(md);
+document.querySelectorAll('#rendered pre').forEach(p=>{{p.style.maxWidth='100%';p.style.overflowX='auto';}});
+
+function escHtml(s){{return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+
+function renderMessages(msgs){{
+  const el = document.getElementById('msg-list');
+  if(!msgs||msgs.length===0){{
+    el.innerHTML='<div style="color:#4b5563;text-align:center;padding:16px">尚無訊息，等待景揚的回饋！</div>';
+    return;
+  }}
+  el.innerHTML = msgs.map(m => {{
+    const isOwner = m.role === 'owner';
+    const align = isOwner ? 'flex-start' : 'flex-end';
+    const bg = isOwner ? '#3b1f6e' : '#1a2e3e';
+    const border = isOwner ? '#6d28d9' : '#1e4060';
+    const label = isOwner ? '👑 景揚' : ('✍️ ' + escHtml(m.from||'寫手蝦'));
+    return `<div style="display:flex;flex-direction:column;align-items:${{align}};margin-bottom:12px">
+      <div style="font-size:.72rem;color:#4b5563;margin-bottom:4px">${{label}} &nbsp;·&nbsp; ${{escHtml(m.timestamp||'')}}</div>
+      <div style="max-width:85%;padding:10px 14px;border-radius:12px;background:${{bg}};border:1px solid ${{border}};color:#cbd5e1;word-break:break-word">
+        ${{marked.parse(m.content||'')}}
+      </div>
+    </div>`;
+  }}).join('');
+  el.scrollTop = el.scrollHeight;
+}}
+
+async function loadMessages(){{
+  try{{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages');
+    const d = await r.json();
+    renderMessages(d.messages||[]);
+  }}catch(e){{
+    document.getElementById('msg-list').innerHTML='<div style="color:#fca5a5">載入失敗</div>';
+  }}
+}}
+
+async function sendReply(){{
+  const input = document.getElementById('reply-input');
+  const text = input.value.trim();
+  if(!text) return;
+  document.getElementById('reply-btn').disabled = true;
+  input.value = '';
+  try{{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{role:'writer', from:AUTHOR, content:text}})
+    }});
+    const d = await r.json();
+    renderMessages(d.messages||[]);
+  }}catch(e){{
+    input.value = text;
+    alert('送出失敗：'+String(e));
+  }}
+  document.getElementById('reply-btn').disabled = false;
+  document.getElementById('reply-input').focus();
+}}
+
+loadMessages();
+</script>
+<style>
+  #rendered h1,#rendered h2,#rendered h3{{color:#34d399;margin:1.2em 0 .5em}}
+  #rendered p{{margin-bottom:.9em}}
+  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac;word-break:break-all}}
+  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em}}
+  #rendered blockquote{{border-left:3px solid #34d399;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
+  #rendered a{{color:#60a5fa;word-break:break-all}}
+  #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
+  #rendered img{{max-width:100%;height:auto;border-radius:8px;display:block}}
+</style>
+"""
+    return HTMLResponse(_writer_base_html(body, f"{am['title']} — 回饋"))
 
 @app.post("/writer/submit")
 async def writer_submit(
@@ -2024,6 +2203,7 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
 
     # Escape for JS string
     content_escaped = json.dumps(content)
+    article_id_json = json.dumps(article_id)
 
     body = f"""
 <div class="card">
@@ -2053,28 +2233,111 @@ def article_view(article_id: str, rag_token: Optional[str] = Cookie(None)):
   "></div>
 </div>
 
+<!-- ── 回饋對話視窗 ─────────────────────────────────────────────────── -->
+<div class="card" id="feedback-card">
+  <h2>💬 回饋給寫手蝦</h2>
+  <p style="font-size:.82rem;color:#64748b;margin-bottom:14px">
+    在這裡留下修改建議或回饋，寫手蝦登入後可看到你的訊息並回覆。
+  </p>
+
+  <!-- Message list -->
+  <div id="msg-list" style="
+    background:#0a0a0f;border:1px solid #1e2235;border-radius:10px;
+    padding:14px;min-height:80px;max-height:500px;overflow-y:auto;
+    margin-bottom:14px;font-size:.87rem;line-height:1.65
+  ">
+    <div id="msg-loading" style="color:#4b5563;text-align:center;padding:16px">載入中…</div>
+  </div>
+
+  <!-- Input -->
+  <div style="display:flex;gap:10px;align-items:flex-end">
+    <textarea id="fb-input" rows="2" placeholder="輸入回饋內容，例如：第二段邏輯有點跳，可以加一個過渡句…"
+      style="flex:1;resize:vertical;min-height:60px;font-family:inherit;font-size:.87rem"
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendFeedback();}}">
+    </textarea>
+    <button class="btn" id="fb-send-btn" onclick="sendFeedback()" style="white-space:nowrap">
+      ➤ 送出
+    </button>
+  </div>
+  <div style="font-size:.75rem;color:#475569;margin-top:6px">Enter 送出 ｜ Shift+Enter 換行</div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 const md = {content_escaped};
+const ARTICLE_ID = {article_id_json};
 document.getElementById('rendered').innerHTML = marked.parse(md);
-// Wrap all tables in scroll containers
+// Wrap tables & pre in scroll containers
 document.querySelectorAll('#rendered table').forEach(function(t){{
   if(!t.parentElement.classList.contains('table-wrap')){{
     var w=document.createElement('div');
     w.className='table-wrap';
     w.style.overflowX='auto';
-    w.style.webkitOverflowScrolling='touch';
-    w.style.maxWidth='100%';
-    t.parentNode.insertBefore(w,t);
-    w.appendChild(t);
+    t.parentNode.insertBefore(w,t);w.appendChild(t);
   }}
 }});
-// Wrap all pre in scroll containers
 document.querySelectorAll('#rendered pre').forEach(function(p){{
-  p.style.maxWidth='100%';
-  p.style.overflowX='auto';
-  p.style.boxSizing='border-box';
+  p.style.maxWidth='100%';p.style.overflowX='auto';p.style.boxSizing='border-box';
 }});
+
+// ── Feedback functions ──────────────────────────────────────────────────────
+function escHtml(s){{return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+
+function renderMessages(msgs){{
+  const el = document.getElementById('msg-list');
+  if(!msgs||msgs.length===0){{
+    el.innerHTML='<div style="color:#4b5563;text-align:center;padding:16px">尚無訊息，成為第一個留言的人！</div>';
+    return;
+  }}
+  el.innerHTML = msgs.map(m => {{
+    const isOwner = m.role === 'owner';
+    const align = isOwner ? 'flex-end' : 'flex-start';
+    const bg = isOwner ? '#3b1f6e' : '#1a2e3e';
+    const border = isOwner ? '#6d28d9' : '#1e4060';
+    const label = isOwner ? '👑 景揚' : ('✍️ ' + escHtml(m.from||'寫手蝦'));
+    return `<div style="display:flex;flex-direction:column;align-items:${{align}};margin-bottom:12px">
+      <div style="font-size:.72rem;color:#4b5563;margin-bottom:4px">${{label}} &nbsp;·&nbsp; ${{escHtml(m.timestamp||'')}}</div>
+      <div style="max-width:85%;padding:10px 14px;border-radius:12px;background:${{bg}};border:1px solid ${{border}};color:#cbd5e1;word-break:break-word">
+        ${{marked.parse(m.content||'')}}
+      </div>
+    </div>`;
+  }}).join('');
+  el.scrollTop = el.scrollHeight;
+}}
+
+async function loadMessages(){{
+  try{{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages');
+    const d = await r.json();
+    renderMessages(d.messages||[]);
+  }}catch(e){{
+    document.getElementById('msg-list').innerHTML='<div style="color:#fca5a5">載入失敗：'+escHtml(String(e))+'</div>';
+  }}
+}}
+
+async function sendFeedback(){{
+  const input = document.getElementById('fb-input');
+  const text = input.value.trim();
+  if(!text) return;
+  document.getElementById('fb-send-btn').disabled = true;
+  input.value = '';
+  try{{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{role:'owner', content:text}})
+    }});
+    const d = await r.json();
+    renderMessages(d.messages||[]);
+  }}catch(e){{
+    input.value = text;
+    alert('送出失敗：'+String(e));
+  }}
+  document.getElementById('fb-send-btn').disabled = false;
+  document.getElementById('fb-input').focus();
+}}
+
+loadMessages();
 </script>
 <style>
   #rendered{{max-width:100%;overflow-x:hidden;word-break:break-word;overflow-wrap:break-word}}
@@ -2095,6 +2358,73 @@ document.querySelectorAll('#rendered pre').forEach(function(p){{
 </style>
 """
     return HTMLResponse(_base_html(body, f"{am['title']} — 文章庫"))
+
+@app.get("/articles/{article_id}/messages")
+def get_article_messages(article_id: str, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
+    """Get messages for an article. Both owner and writer can read."""
+    if not _auth(rag_token) and not _auth_writer(writer_token):
+        raise HTTPException(401, "Not authenticated")
+    msgs = _article_messages.get(article_id, [])
+    return {"article_id": article_id, "messages": msgs}
+
+@app.post("/articles/{article_id}/messages")
+async def post_article_message(article_id: str, payload: dict, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
+    """Post a message. Owner uses rag_token, writer uses writer_token."""
+    is_owner  = _auth(rag_token)
+    is_writer = _auth_writer(writer_token)
+    if not is_owner and not is_writer:
+        raise HTTPException(401, "Not authenticated")
+
+    content = (payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "content is required")
+
+    role = "owner" if is_owner else "writer"
+    from_name = payload.get("from", "景揚" if is_owner else "寫手蝦")
+    msg = {
+        "role": role,
+        "from": from_name,
+        "content": content,
+        "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
+    }
+    if article_id not in _article_messages:
+        _article_messages[article_id] = []
+    _article_messages[article_id].append(msg)
+    _save_article_messages()
+    return {"article_id": article_id, "messages": _article_messages[article_id]}
+
+@app.post("/articles/{article_id}/revise")
+async def writer_revise_article(article_id: str, writer_token: Optional[str] = Cookie(None), file: UploadFile = File(...), note: str = Form("")):
+    """Writer submits a revised version of an article."""
+    if not _auth_writer(writer_token):
+        raise HTTPException(401, "Not authenticated")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404, "Article not found")
+
+    raw = await file.read()
+    text = raw.decode("utf-8", errors="replace")
+    path = Path(am["path"])
+    path.write_text(text, encoding="utf-8")
+
+    # Update metadata
+    am["size"] = len(raw)
+    am["revised_at"] = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+    _save_articlemeta()
+
+    # Append a system message about the revision
+    if article_id not in _article_messages:
+        _article_messages[article_id] = []
+    revision_note = note.strip() or "（無備註）"
+    _article_messages[article_id].append({
+        "role": "writer",
+        "from": am.get("author", "寫手蝦"),
+        "content": f"📝 **已提交修改版本**\n\n修改說明：{revision_note}",
+        "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
+    })
+    _save_article_messages()
+    return RedirectResponse(f"/writer/article/{article_id}?msg=修改版已送出！", status_code=303)
+
 
 @app.get("/articles/{article_id}/download")
 def article_download(article_id: str, rag_token: Optional[str] = Cookie(None)):
