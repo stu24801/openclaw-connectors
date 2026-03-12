@@ -14,6 +14,11 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Cookie, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, StreamingResponse
 
+# ── OpenClaw Gateway ─────────────────────────────────────────────────────────
+OPENCLAW_GATEWAY_URL   = os.getenv("OPENCLAW_GATEWAY_URL",   "http://127.0.0.1:8080")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "3056ad885dd941a5795fb4ac8dcd10b677ac4d2c5d4f696f")
+WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:writer:main")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
 FILES_DIR     = DATA_DIR / "files"
@@ -180,7 +185,73 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K, category: Optional[str] = No
 
 # ── QMD update+embed (background) ────────────────────────────────────────────
 
-def _qmd_update_embed():
+def _notify_writer(article_title: str, article_id: str, owner_message: str) -> bool:
+    """Send feedback notification to 寫手蝦 via OpenClaw Gateway sessions_send."""
+    article_url = f"https://rag.alex-stu24801.com/writer/article/{article_id}"
+    payload = {
+        "tool": "sessions_send",
+        "args": {
+            "sessionKey": WRITER_SESSION_KEY,
+            "message": (
+                f"📬 **景揚對文章留下了回饋**\n\n"
+                f"📄 文章：**{article_title}**\n"
+                f"💬 內容：{owner_message}\n\n"
+                f"👉 前往查看並回覆：{article_url}"
+            )
+        }
+    }
+    try:
+        req = urllib.request.Request(
+            f"{OPENCLAW_GATEWAY_URL}/tools/invoke",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"[notify_writer] error: {e}")
+        return False
+
+
+def _notify_owner(article_title: str, article_id: str, writer_name: str, reply_content: str) -> bool:
+    """Notify 景揚 when 寫手蝦 replies to feedback."""
+    article_url = f"https://rag.alex-stu24801.com/articles/{article_id}"
+    payload = {
+        "tool": "sessions_send",
+        "args": {
+            "sessionKey": "agent:main:main",
+            "message": (
+                f"✍️ **寫手蝦（{writer_name}）回覆了你的回饋**\n\n"
+                f"📄 文章：**{article_title}**\n"
+                f"💬 回覆：{reply_content}\n\n"
+                f"👉 查看文章：{article_url}"
+            )
+        }
+    }
+    try:
+        req = urllib.request.Request(
+            f"{OPENCLAW_GATEWAY_URL}/tools/invoke",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+        return result.get("ok", False)
+    except Exception as e:
+        print(f"[notify_owner] error: {e}")
+        return False
+
+
+
     try:
         subprocess.run([QMD_BIN, "update"], capture_output=True, timeout=120)
         subprocess.run([QMD_BIN, "embed"], capture_output=True, timeout=600)
@@ -2391,6 +2462,27 @@ async def post_article_message(article_id: str, payload: dict, rag_token: Option
         _article_messages[article_id] = []
     _article_messages[article_id].append(msg)
     _save_article_messages()
+
+    # Owner 留言 → 即時通知寫手蝦
+    if is_owner:
+        am = next((a for a in _articlemeta if a["id"] == article_id), None)
+        if am:
+            threading.Thread(
+                target=_notify_writer,
+                args=(am["title"], article_id, content),
+                daemon=True,
+            ).start()
+
+    # 寫手蝦回覆 → 即時通知景揚
+    if is_writer:
+        am = next((a for a in _articlemeta if a["id"] == article_id), None)
+        if am:
+            threading.Thread(
+                target=_notify_owner,
+                args=(am["title"], article_id, from_name, content),
+                daemon=True,
+            ).start()
+
     return {"article_id": article_id, "messages": _article_messages[article_id]}
 
 @app.post("/articles/{article_id}/revise")
@@ -2423,6 +2515,12 @@ async def writer_revise_article(article_id: str, writer_token: Optional[str] = C
         "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
     })
     _save_article_messages()
+    # Notify 景揚 about the revision
+    threading.Thread(
+        target=_notify_owner,
+        args=(am["title"], article_id, am.get("author", "寫手蝦"), f"📝 已提交修改版本\n修改說明：{revision_note}"),
+        daemon=True,
+    ).start()
     return RedirectResponse(f"/writer/article/{article_id}?msg=修改版已送出！", status_code=303)
 
 
