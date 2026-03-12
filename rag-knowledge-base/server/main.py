@@ -185,26 +185,31 @@ def _sqlite_vsearch(query: str, top_k: int = TOP_K, category: Optional[str] = No
 
 # ── QMD update+embed (background) ────────────────────────────────────────────
 
-def _notify_writer(article_title: str, article_id: str, owner_message: str) -> bool:
-    """Send feedback notification to 寫手蝦 via OpenClaw Gateway sessions_send."""
-    post_reply_cmd = (
-        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages "
-        f"-H 'Content-Type: application/json' "
-        f"-H 'X-Writer-Token: writer123' "
-        f"-d '{{\"role\":\"writer\",\"from\":\"寫手蝦\",\"content\":\"你的回覆內容\"}}'"
+def _ask_writer_agent(article_id: str, owner_message: str):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am: return
+
+    path = Path(am["path"])
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    # get last few messages for context
+    msgs = _article_messages.get(article_id, [])
+    history_text = "\\n".join([f"[{m['role']}] {m['content']}" for m in msgs[-5:]])
+
+    prompt = (
+        f"你是「寫手蝦」，負責協助景揚維護知識庫文章。以下是目前文章內容與近期的對話紀錄。\\n\\n"
+        f"【當前文章內容】\\n```md\\n{content}\\n```\\n\\n"
+        f"【近期對話紀錄】\\n{history_text}\\n\\n"
+        f"請針對景揚的最新指示提出回覆。\\n"
+        f"⚠️ **重要：如果你決定根據指示修改文章，請在回覆的最尾端，使用 `<revised_article>` 與 `</revised_article>` 標籤包住『完整的新版文章內容』。**\\n"
+        f"系統會自動擷取標籤內的內容並儲存為新版本供景揚對照。"
     )
+
     payload = {
         "tool": "sessions_send",
         "args": {
             "sessionKey": WRITER_SESSION_KEY,
-            "message": (
-                f"📬 **景揚對文章留下了回饋，請你閱讀並回覆**\n\n"
-                f"📄 文章：**{article_title}**\n"
-                f"💬 景揚的回饋：{owner_message}\n\n"
-                f"請使用 rag-article-feedback skill 處理，並用以下 API 把回覆寫進對話視窗：\n\n"
-                f"```bash\n{post_reply_cmd}\n```\n\n"
-                f"article_id: `{article_id}`"
-            )
+            "message": prompt
         }
     }
     try:
@@ -217,15 +222,68 @@ def _notify_writer(article_title: str, article_id: str, owner_message: str) -> b
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        # 增加 Timeout 讓 LLM 有時間產出文章
+        with urllib.request.urlopen(req, timeout=180) as resp:
             result = json.loads(resp.read())
-        return result.get("ok", False)
+        
+        details = result.get("details", {})
+        reply = details.get("reply", "")
+        if not reply:
+            reply = "（寫手蝦沒有回應，可能是網路中斷）"
+
+        # 擷取修改後的文章
+        new_content = None
+        m = re.search(r"<revised_article>(.*?)</revised_article>", reply, re.DOTALL)
+        if m:
+            new_content = m.group(1).strip()
+            reply = re.sub(r"<revised_article>.*?</revised_article>", "\\n\\n*(已為你產生新版文章，請在上方版本紀錄切換查看)*", reply, flags=re.DOTALL).strip()
+        
+        # 把回覆寫回對話框
+        _article_messages[article_id].append({
+            "role": "writer",
+            "from": "寫手蝦",
+            "content": reply,
+            "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+        })
+        _save_article_messages()
+
+        # 如果有新版本，更新 articlemeta
+        if new_content:
+            ver_id = str(uuid.uuid4())[:8]
+            old_path = Path(am["path"])
+            ver_path = old_path.parent / f"{old_path.stem}_v_{ver_id}.md"
+            ver_path.write_text(new_content, encoding="utf-8")
+            
+            if "versions" not in am:
+                am["versions"] = [{
+                    "id": "v1",
+                    "timestamp": am.get("uploaded_at"),
+                    "path": str(old_path)
+                }]
+            
+            am["path"] = str(ver_path)
+            am["size"] = len(new_content.encode())
+            am["uploaded_at"] = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+            
+            am["versions"].append({
+                "id": ver_id,
+                "timestamp": am["uploaded_at"],
+                "path": str(ver_path)
+            })
+            _save_articlemeta()
+
     except Exception as e:
-        print(f"[notify_writer] error: {e}")
-        return False
+        print(f"[_ask_writer_agent] error: {e}")
+        _article_messages[article_id].append({
+            "role": "writer",
+            "from": "系統",
+            "content": f"⚠️ 連線寫手蝦失敗，或寫手蝦思考逾時：{e}",
+            "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+        })
+        _save_article_messages()
 
-
-def _notify_owner(article_title: str, article_id: str, writer_name: str, reply_content: str) -> bool:
+def _notify_owner(
+article_title: str, article_id: str, writer_name: str, reply_content: str) -> bool:
     """Notify 景揚 when 寫手蝦 replies to feedback."""
     article_url = f"https://rag.alex-stu24801.com/articles/{article_id}"
     payload = {
@@ -2101,7 +2159,8 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}}
+setInterval(loadMessages, 5000););
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2388,7 +2447,8 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}}
+setInterval(loadMessages, 5000););
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2483,8 +2543,8 @@ async def post_article_message(article_id: str, payload: dict, request: Request,
         am = next((a for a in _articlemeta if a["id"] == article_id), None)
         if am:
             threading.Thread(
-                target=_notify_writer,
-                args=(am["title"], article_id, content),
+                target=_ask_writer_agent,
+                args=(article_id, content),
                 daemon=True,
             ).start()
 
