@@ -2094,7 +2094,7 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages');
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2109,7 +2109,7 @@ async function sendReply(){{
   document.getElementById('reply-btn').disabled = true;
   input.value = '';
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include',
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
       body: JSON.stringify({{role:'writer', from:AUTHOR, content:text}})
@@ -2378,7 +2378,7 @@ function renderMessages(msgs){{
 
 async function loadMessages(){{
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages');
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
     const d = await r.json();
     renderMessages(d.messages||[]);
   }}catch(e){{
@@ -2393,7 +2393,7 @@ async function sendFeedback(){{
   document.getElementById('fb-send-btn').disabled = true;
   input.value = '';
   try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{
+    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include',
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
       body: JSON.stringify({{role:'owner', content:text}})
