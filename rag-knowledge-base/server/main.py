@@ -2103,9 +2103,11 @@ async function loadMessages(){{
 }}
 
 async function sendReply(){{
+  if(window._replySending) return;
+  window._replySending = true;
   const input = document.getElementById('reply-input');
   const text = input.value.trim();
-  if(!text) return;
+  if(!text){{ window._replySending=false; return; }}
   document.getElementById('reply-btn').disabled = true;
   input.value = '';
   try{{
@@ -2122,6 +2124,7 @@ async function sendReply(){{
   }}
   document.getElementById('reply-btn').disabled = false;
   document.getElementById('reply-input').focus();
+  window._replySending = false;
 }}
 
 loadMessages();
@@ -2387,9 +2390,11 @@ async function loadMessages(){{
 }}
 
 async function sendFeedback(){{
+  if(window._fbSending) return;
+  window._fbSending = true;
   const input = document.getElementById('fb-input');
   const text = input.value.trim();
-  if(!text) return;
+  if(!text){{ window._fbSending=false; return; }}
   document.getElementById('fb-send-btn').disabled = true;
   input.value = '';
   try{{
@@ -2406,6 +2411,7 @@ async function sendFeedback(){{
   }}
   document.getElementById('fb-send-btn').disabled = false;
   document.getElementById('fb-input').focus();
+  window._fbSending = false;
 }}
 
 loadMessages();
