@@ -65,4 +65,4 @@ _Good luck out there. Make it count._
    
 2. **RAG 知識庫上傳 (若有需要)**：
    - 如果是要上傳 Markdown 文章到 RAG 站台，請使用 `rag-writer` skill。
-   - 密碼（Writer Token）為：`writer123`
+   - 密碼（Writer Token）為：`YOUR_TOKEN_HERE`
