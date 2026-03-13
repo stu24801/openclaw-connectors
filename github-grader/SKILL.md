@@ -51,41 +51,33 @@ User-Agent: openclaw-grader
 
 回傳的 `tree[]` 陣列中，type=blob 的是檔案。
 
-### Step 3 — 讀取程式碼
+### Step 3 — 讀取程式碼（完整傳入，不截取片段）
 
-只讀副檔名為 `.java .kt .py .ts .js .go .cs .sql .md .xml .gradle` 的檔案。
-跳過路徑含 `test` `target` `build` `node_modules` `__pycache__` `.git` 的項目。
-最多讀 30 個檔案，每個最多讀 3000 字元。
+讀取副檔名為 `.java .kt .py .ts .js .go .cs .sql .md .xml .gradle` 的**完整**檔案內容。
+跳過路徑含 `test` `target` `build` `node_modules` `__pycache__` `.git` `dist` `vendor` 等目錄。
+跳過 lock 檔案：`package-lock.json` `yarn.lock` `poetry.lock` 等。
 
 ```http
 GET https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
 Authorization: Bearer {token}   # 私有 repo 才需要
 ```
 
-優先讀取順序：
-1. `README.md`
-2. `*Controller*`, `*Router*`
-3. `*Service*`
-4. `*Entity*`, `*Model*`
-5. `*Repository*`, `*DAO*`
-6. `*.sql`, `schema.sql`
-7. `pom.xml`, `build.gradle`, `package.json`
+**Token 保護策略：**
+- 若所有程式碼 ≤ 600KB（約 15 萬 token）→ 全部傳入 AI
+- 若超過 → 優先保留 `.java .kt .py .ts .js .go .cs .sql` 邏輯檔案，直到填滿 600KB 為止
+
+**AI 自行決定重點：** 不預先截取片段，讓 AI 看完整程式碼後自行判斷評分依據。
 
 ### Step 4 — 回傳摘要
 
 ```
 Repo: {owner}/{repo} @{branch}
-共 {N} 個檔案，讀取 {M} 個程式碼檔案
+共 {N} 個檔案，讀取 {M} 個程式碼檔案（{KB}KB）
 
 📄 讀取的檔案：
-- src/main/java/.../UserController.java  (1234 bytes)
-- src/main/java/.../UserService.java     (2891 bytes)
+- src/main/java/.../UserController.java  (完整內容)
+- src/main/java/.../UserService.java     (完整內容)
 ...
-
-📦 技術棧（依 pom.xml / build.gradle 判斷）：
-- Spring Boot 3.x, JPA, MySQL
-
-🔑 主要 Entity：User, Post, Follow, Like
 ```
 
 ---
