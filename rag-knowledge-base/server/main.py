@@ -1019,15 +1019,31 @@ def _parse_github_url(url: str) -> tuple:
     raise ValueError(f"無法解析 GitHub URL: {url}")
 
 PRIORITY_EXTS = {".java", ".kt", ".py", ".ts", ".js", ".go", ".cs", ".sql", ".md", ".xml", ".gradle"}
-PRIORITY_DIRS = {"src", "main", "controller", "service", "entity", "repository", "model", "api", "db"}
+SKIP_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot",
+             ".zip", ".tar", ".gz", ".lock", ".bin", ".class", ".pyc", ".cache"}
+SKIP_DIRS = {"test", "tests", ".git", "target", "build", "node_modules", "__pycache__",
+             ".gradle", ".idea", ".vscode", "dist", "out", "coverage", "static", "assets",
+             "public", "vendor", "migrations"}
+# Lock / generated files to skip even if extension matches
+SKIP_FILENAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+                  "Pipfile.lock", "Gemfile.lock", "go.sum"}
+
+MAX_TOTAL_BYTES = 600_000   # ~150K tokens; pass everything below this
+FALLBACK_MAX_FILES = 60     # if over limit, keep up to this many files (largest logic files first)
 
 def _should_read(path: str) -> bool:
-    ext = Path(path).suffix.lower()
-    if ext not in PRIORITY_EXTS:
+    """Return True if file should be included in code context."""
+    p = Path(path)
+    if p.name in SKIP_FILENAMES:
         return False
-    parts = set(Path(path).parts)
-    # Skip test files and build output
-    if any(p in parts for p in {"test", "tests", ".git", "target", "build", "node_modules", "__pycache__"}):
+    ext = p.suffix.lower()
+    if ext in SKIP_EXTS:
+        return False
+    parts = set(p.parts)
+    if any(part in SKIP_DIRS for part in parts):
+        return False
+    # Accept known code extensions, or files with no extension that look like code
+    if ext not in PRIORITY_EXTS and ext != "":
         return False
     return True
 
@@ -1060,51 +1076,74 @@ async def grade_api(payload: dict):
     except Exception as e:
         raise HTTPException(502, f"GitHub API 錯誤：{e}")
 
-    code_files = [item["path"] for item in tree if _should_read(item["path"])][:30]
-    code_snippets = []
-    for fpath in code_files:
+    candidate_files = [item["path"] for item in tree if _should_read(item["path"])]
+
+    # Fetch all candidate files, then decide how much to include
+    code_files_raw: List[dict] = []
+    for fpath in candidate_files:
         content = _github_file(owner, repo, branch, fpath, token)
         if content:
-            code_snippets.append({"path": fpath, "content": content[:3000]})
+            code_files_raw.append({"path": fpath, "content": content})
+
+    total_bytes = sum(len(f["content"]) for f in code_files_raw)
+    truncation_note = ""
+    if total_bytes <= MAX_TOTAL_BYTES:
+        code_files_used = code_files_raw
+    else:
+        # Fallback: drop lock/config files, keep logic-heavy files up to limit
+        logic_exts = {".java", ".kt", ".py", ".ts", ".js", ".go", ".cs", ".sql"}
+        logic_files = [f for f in code_files_raw if Path(f["path"]).suffix.lower() in logic_exts]
+        other_files = [f for f in code_files_raw if Path(f["path"]).suffix.lower() not in logic_exts]
+        code_files_used = []
+        used_bytes = 0
+        for f in logic_files + other_files:
+            if used_bytes + len(f["content"]) > MAX_TOTAL_BYTES:
+                break
+            code_files_used.append(f)
+            used_bytes += len(f["content"])
+        truncation_note = (
+            f"\n⚠️ 注意：此 repo 原始碼超過 600KB（{total_bytes//1024}KB），"
+            f"已傳入前 {len(code_files_used)} 個最相關的邏輯檔案（{used_bytes//1024}KB）。"
+        )
+
+    full_code_content = "\n\n".join(
+        f"### 📄 {f['path']}\n```\n{f['content']}\n```"
+        for f in code_files_used
+    )
 
     questions_text = ""
     for q in questions:
         qcontent = Path(q["path"]).read_text(encoding="utf-8")
         questions_text += f"\n\n---\n## 題目：{q['source_name']}\n{qcontent}"
 
-    code_summary = "\n\n".join(
-        f"### {s['path']}\n```\n{s['content'][:1500]}\n```"
-        for s in code_snippets[:15]
-    )
-    grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
+    grading_prompt = f"""你是一位專業的程式碼評審官。
+請根據以下評分標準，對考生提交的程式碼進行評分。
 
 ⚠️ 重要規則：評分時必須嚴格遵守「評分方式」文件中的每一條規則。分數只能按照評分標準計算，不得自行加分、寬鬆評分或給予同情分。若程式碼未完整實作某功能，該項目只能得到實際完成比例應得的分數。
 
-請根據以下資訊進行評分：
-
-# 考題內容
-{questions_text}
-
-# 評分方式
+# 評分標準
 {scoring_content}
 
-# 應試者的 GitHub Repo
-- URL: {repo_url}
-- 分支: {branch}
-- 共 {len(tree)} 個檔案，已讀取 {len(code_snippets)} 個主要程式碼檔案
+# 題目說明
+{questions_text}
 
-# 程式碼內容
-{code_summary}
+# 考生提交的完整程式碼
+
+以下是考生 GitHub repo 的完整程式碼內容（你可以自行決定要重點檢視哪些部分）：
+
+- Repo: {repo_url}
+- 分支: {branch}
+- 共 {len(tree)} 個檔案，傳入 {len(code_files_used)} 個程式碼檔案{truncation_note}
+
+{full_code_content}
 
 ---
 
-請完成以下任務：
-
-1. **判定題目**：分析程式碼，確認這份 repo 對應「考題內容」中的哪一道題目，說明判斷依據。
-
-2. **逐項評分**：按照「評分方式」的每個評分項目，逐一評定是否達標，給出分數。
-
-3. **輸出報告**，格式如下：
+## 請你：
+1. 自行分析哪些程式碼與各評分項目相關
+2. **判定題目**：確認這份 repo 對應哪一道題目，說明判斷依據
+3. 針對每個評分項目給出分數與理由（格式含✅⚠️❌）
+4. 給出總分統計表格與整體評語
 
 # 📋 評分報告
 
@@ -1127,7 +1166,8 @@ async def grade_api(payload: dict):
 """
     return {
         "owner": owner, "repo": repo, "branch": branch,
-        "file_count": len(tree), "code_files_read": len(code_snippets),
+        "file_count": len(tree), "code_files_read": len(code_files_used),
+        "total_bytes": total_bytes,
         "questions_available": [q["source_name"] for q in questions],
         "grading_prompt": grading_prompt,
     }
@@ -1173,18 +1213,41 @@ async def grade_stream(repo_url: str, token: str = ""):
                 yield sse("error", f"GitHub API 錯誤：{e}"); return
             yield sse("progress", f"📁 共找到 {len(tree)} 個檔案")
 
-            code_files = [item["path"] for item in tree if _should_read(item["path"])][:30]
+            code_files = [item["path"] for item in tree if _should_read(item["path"])]
             yield sse("progress", f"📖 讀取 {len(code_files)} 個程式碼檔案…")
 
-            code_snippets = []
+            code_files_raw: list = []
             for i, fpath in enumerate(code_files):
                 content = _github_file(owner, repo, branch, fpath, _token)
                 if content:
-                    code_snippets.append({"path": fpath, "content": content[:3000]})
+                    code_files_raw.append({"path": fpath, "content": content})
                 if (i+1) % 5 == 0:
                     yield sse("progress", f"  已讀取 {i+1}/{len(code_files)} 個檔案…")
 
-            yield sse("progress", f"✅ 成功讀取 {len(code_snippets)} 個程式碼檔案")
+            yield sse("progress", f"✅ 成功讀取 {len(code_files_raw)} 個程式碼檔案")
+
+            # Decide whether to include all or fallback
+            total_bytes = sum(len(f["content"]) for f in code_files_raw)
+            truncation_note = ""
+            if total_bytes <= MAX_TOTAL_BYTES:
+                code_files_used = code_files_raw
+                yield sse("progress", f"📦 原始碼總計 {total_bytes//1024}KB，全部傳入 AI")
+            else:
+                logic_exts = {".java", ".kt", ".py", ".ts", ".js", ".go", ".cs", ".sql"}
+                logic_files = [f for f in code_files_raw if Path(f["path"]).suffix.lower() in logic_exts]
+                other_files = [f for f in code_files_raw if Path(f["path"]).suffix.lower() not in logic_exts]
+                code_files_used = []
+                used_bytes = 0
+                for f in logic_files + other_files:
+                    if used_bytes + len(f["content"]) > MAX_TOTAL_BYTES:
+                        break
+                    code_files_used.append(f)
+                    used_bytes += len(f["content"])
+                truncation_note = (
+                    f"\n⚠️ 注意：此 repo 原始碼超過 600KB（{total_bytes//1024}KB），"
+                    f"已傳入前 {len(code_files_used)} 個最相關的邏輯檔案（{used_bytes//1024}KB）。"
+                )
+                yield sse("progress", f"⚠️ 原始碼 {total_bytes//1024}KB 超過上限，已篩選 {len(code_files_used)} 個邏輯檔案（{used_bytes//1024}KB）")
 
             # Build questions text
             questions_text = ""
@@ -1192,40 +1255,39 @@ async def grade_stream(repo_url: str, token: str = ""):
                 qcontent = Path(q["path"]).read_text(encoding="utf-8")
                 questions_text += f"\n\n---\n## 題目：{q['source_name']}\n{qcontent}"
 
-            code_summary = "\n\n".join(
-                f"### {s['path']}\n```\n{s['content'][:1500]}\n```"
-                for s in code_snippets[:15]
+            full_code_content = "\n\n".join(
+                f"### 📄 {f['path']}\n```\n{f['content']}\n```"
+                for f in code_files_used
             )
 
-            grading_prompt = f"""你是一位嚴格但公正的後端工程師面試評審。
+            grading_prompt = f"""你是一位專業的程式碼評審官。
+請根據以下評分標準，對考生提交的程式碼進行評分。
 
 ⚠️ 重要規則：評分時必須嚴格遵守「評分方式」文件中的每一條規則。分數只能按照評分標準計算，不得自行加分、寬鬆評分或給予同情分。若程式碼未完整實作某功能，該項目只能得到實際完成比例應得的分數。
 
-請根據以下資訊進行評分：
-
-# 考題內容
-{questions_text}
-
-# 評分方式
+# 評分標準
 {scoring_content}
 
-# 應試者的 GitHub Repo
-- URL: {repo_url}
-- 分支: {branch}
-- 共 {len(tree)} 個檔案，已讀取 {len(code_snippets)} 個主要程式碼檔案
+# 題目說明
+{questions_text}
 
-# 程式碼內容
-{code_summary}
+# 考生提交的完整程式碼
+
+以下是考生 GitHub repo 的完整程式碼內容（你可以自行決定要重點檢視哪些部分）：
+
+- Repo: {repo_url}
+- 分支: {branch}
+- 共 {len(tree)} 個檔案，傳入 {len(code_files_used)} 個程式碼檔案{truncation_note}
+
+{full_code_content}
 
 ---
 
-請完成以下任務：
-
-1. **判定題目**：分析程式碼，確認這份 repo 對應「考題內容」中的哪一道題目，說明判斷依據。
-
-2. **逐項評分**：按照「評分方式」的每個評分項目，逐一評定是否達標，給出分數。
-
-3. **輸出報告**，格式如下：
+## 請你：
+1. 自行分析哪些程式碼與各評分項目相關
+2. **判定題目**：確認這份 repo 對應哪一道題目，說明判斷依據
+3. 針對每個評分項目給出分數與理由（格式含✅⚠️❌）
+4. 給出總分統計表格與整體評語
 
 # 📋 評分報告
 
@@ -1250,7 +1312,7 @@ async def grade_stream(repo_url: str, token: str = ""):
             # Send the full prompt as a done event
             yield sse("done", json.dumps({
                 "owner": owner, "repo": repo, "branch": branch,
-                "file_count": len(tree), "code_files_read": len(code_snippets),
+                "file_count": len(tree), "code_files_read": len(code_files_used),
                 "questions_available": q_names,
                 "grading_prompt": grading_prompt,
             }))
