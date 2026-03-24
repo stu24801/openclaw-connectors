@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 
 # ── OpenClaw Gateway ─────────────────────────────────────────────────────────
 OPENCLAW_GATEWAY_URL   = os.getenv("OPENCLAW_GATEWAY_URL",   "http://127.0.0.1:8080")
-OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_GATEWAY_TOKEN_REDACTED")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:writer:main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -31,8 +31,8 @@ VEC0_SO       = os.path.expanduser(os.getenv("VEC0_SO",
 EMBED_URL     = os.getenv("EMBED_URL", "http://127.0.0.1:8766/embed")
 QMD_COLL      = "rag-kb"
 TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
-PASSWORD        = os.getenv("RAG_PASSWORD", "changeme")
-WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "WRITER_PASSWORD_REDACTED")
+PASSWORD        = os.getenv("RAG_PASSWORD", "")
+WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "")
 
 # ── Articles (writer uploads) ─────────────────────────────────────────────────
 ARTICLES_DIR      = DATA_DIR / "articles"
