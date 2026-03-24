@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 # ── OpenClaw Gateway ─────────────────────────────────────────────────────────
 OPENCLAW_GATEWAY_URL   = os.getenv("OPENCLAW_GATEWAY_URL",   "http://127.0.0.1:8080")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_GATEWAY_TOKEN_REDACTED")
-WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:writer:main")
+WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:main:main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
@@ -90,6 +90,15 @@ def _category_tree() -> dict:
     return tree
 
 # ── Embedding (via embed_server on port 8766) ─────────────────────────────────
+
+def _qmd_update_embed():
+    """Background task to update QMD embeddings after file upload."""
+    import subprocess, os
+    qmd_bin = os.getenv("QMD_BIN", "qmd")
+    try:
+        subprocess.run([qmd_bin, "embed", "--dir", DATA_DIR], timeout=120, capture_output=True)
+    except Exception:
+        pass
 
 def _get_embedding(text: str) -> Optional[bytes]:
     try:
@@ -195,22 +204,26 @@ def _ask_writer_agent(article_id: str, owner_message: str):
 
     # get last few messages for context
     msgs = _article_messages.get(article_id, [])
-    history_text = "\\n".join([f"[{m['role']}] {m['content']}" for m in msgs[-5:]])
+    history_text = "\\n".join([f"[{m['role']}] {m.get('content', '')}" for m in msgs[-5:]])
 
     prompt = (
-        f"你是「寫手蝦」，負責協助景揚維護知識庫文章。以下是目前文章內容與近期的對話紀錄。\\n\\n"
-        f"【當前文章內容】\\n```md\\n{content}\\n```\\n\\n"
-        f"【近期對話紀錄】\\n{history_text}\\n\\n"
-        f"請針對景揚的最新指示提出回覆。\\n"
-        f"⚠️ **重要：如果你決定根據指示修改文章，請在回覆的最尾端，使用 `<revised_article>` 與 `</revised_article>` 標籤包住『完整的新版文章內容』。**\\n"
-        f"系統會自動擷取標籤內的內容並儲存為新版本供景揚對照。"
+        f"🦐 景揚在文章《{am['title']}》的對話通道傳來訊息：\n\n"
+        f"「{owner_message}」\n\n"
+        f"📄 文章 ID：{article_id}\n"
+        f"🔗 對話介面：https://rag.alex-stu24801.com/articles/{article_id}\n\n"
+        f"請你立即回覆景揚。步驟：\n"
+        f"1. 透過 POST https://rag.alex-stu24801.com/articles/{article_id}/messages 回覆\n"
+        f"   （X-Writer-Token header，使用自然對話口吻，簡短即可）\n"
+        f"2. 若需要修改文章內容，再透過 POST https://rag.alex-stu24801.com/articles/{article_id}/revise 提交修改版\n"
+        f"⚠️ 回覆訊息時，『絕對不要』貼出整篇文章或任何文章片段，只需用簡短自然的對話告訴景揚你的想法或已完成的修改。"
     )
 
     payload = {
         "tool": "sessions_send",
         "args": {
             "sessionKey": WRITER_SESSION_KEY,
-            "message": prompt
+            "message": prompt,
+            "timeoutSeconds": 0
         }
     }
     try:
@@ -223,62 +236,15 @@ def _ask_writer_agent(article_id: str, owner_message: str):
             },
             method="POST",
         )
-        # 增加 Timeout 讓 LLM 有時間產出文章
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read())
-        
-        details = result.get("details", {})
-        reply = details.get("reply", "")
-        if not reply:
-            reply = "（寫手蝦沒有回應，可能是網路中斷）"
-
-        # 擷取修改後的文章
-        new_content = None
-        m = re.search(r"<revised_article>(.*?)</revised_article>", reply, re.DOTALL)
-        if m:
-            new_content = m.group(1).strip()
-            reply = re.sub(r"<revised_article>.*?</revised_article>", "\\n\\n*(已為你產生新版文章，請在上方版本紀錄切換查看)*", reply, flags=re.DOTALL).strip()
-        
-        # 把回覆寫回對話框
-        _article_messages[article_id].append({
-            "role": "writer",
-            "from": "寫手蝦",
-            "content": reply,
-            "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
-        })
-        _save_article_messages()
-
-        # 如果有新版本，更新 articlemeta
-        if new_content:
-            ver_id = str(uuid.uuid4())[:8]
-            old_path = Path(am["path"])
-            ver_path = old_path.parent / f"{old_path.stem}_v_{ver_id}.md"
-            ver_path.write_text(new_content, encoding="utf-8")
-            
-            if "versions" not in am:
-                am["versions"] = [{
-                    "id": "v1",
-                    "timestamp": am.get("uploaded_at"),
-                    "path": str(old_path)
-                }]
-            
-            am["path"] = str(ver_path)
-            am["size"] = len(new_content.encode())
-            am["uploaded_at"] = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
-            
-            am["versions"].append({
-                "id": ver_id,
-                "timestamp": am["uploaded_at"],
-                "path": str(ver_path)
-            })
-            _save_articlemeta()
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pass  # 只需發送通知，寫手蝦會透過 API 自行回覆與修改文章
 
     except Exception as e:
         print(f"[_ask_writer_agent] error: {e}")
         _article_messages[article_id].append({
             "role": "writer",
             "from": "系統",
-            "content": f"⚠️ 連線寫手蝦失敗，或寫手蝦思考逾時：{e}",
+            "content": f"⚠️ 連線寫手蝦失敗：{e}",
             "timestamp": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
         })
         _save_article_messages()
@@ -296,7 +262,8 @@ article_title: str, article_id: str, writer_name: str, reply_content: str) -> bo
                 f"📄 文章：**{article_title}**\n"
                 f"💬 回覆：{reply_content}\n\n"
                 f"👉 查看文章：{article_url}"
-            )
+            ),
+            "timeoutSeconds": 0
         }
     }
     try:
@@ -482,6 +449,7 @@ def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = 
     <a href="/search_ui">搜尋</a>
     <a href="/grade_ui">📝 評分</a>
     <a href="/articles">📰 文章庫</a>
+    <a href="/sys_status">🖥️ 系統狀態</a>
     <a href="/logout" class="topbar-logout">登出</a>
   </div>
 </div>
@@ -1421,6 +1389,23 @@ def grade_ui(rag_token: Optional[str] = Cookie(None)):
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({{ startOnLoad: false, theme: 'dark' }});
+
+function renderMermaid() {{
+  document.querySelectorAll('code.language-mermaid').forEach(function(code) {{
+    var pre = code.parentElement;
+    if (pre.tagName === 'PRE') {{
+      var div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = code.textContent;
+      pre.parentElement.replaceChild(div, pre);
+    }}
+  }});
+  mermaid.init(undefined, document.querySelectorAll('.mermaid'));
+}}
+</script>
 <script>
 let _prompt   = '';
 let _reportMd = '';
@@ -1596,13 +1581,33 @@ function appendChatMsg(role, content) {{
 }}
 
 function appendChatThinking() {{
+  removeChatThinking(); // 清除舊的（防止重複）
   const el = document.getElementById('chat-messages');
   const div = document.createElement('div');
   div.id = 'chat-thinking';
   div.style.cssText = 'margin-bottom:14px;display:flex;align-items:flex-start';
-  div.innerHTML = '<div style="padding:10px 14px;background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;color:#64748b;font-size:.87rem">⏳ AI 思考中…</div>';
+  div.innerHTML = '<div style="padding:10px 14px;background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;color:#64748b;font-size:.87rem;display:flex;align-items:center;gap:8px">'
+    + '<span style="display:inline-block;width:14px;height:14px;border:2px solid #2d3154;border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></span>'
+    + '🤖 AI 正在思考中<span id="chat-thinking-dot"></span>'
+    + '</div>';
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
+  // 動態省略號動畫
+  let _n = 0;
+  window._chatThinkingTimer = setInterval(() => {{
+    _n = (_n % 3) + 1;
+    const d = document.getElementById('chat-thinking-dot');
+    if (d) d.textContent = '.'.repeat(_n);
+  }}, 500);
+}}
+
+function removeChatThinking() {{
+  if (window._chatThinkingTimer) {{
+    clearInterval(window._chatThinkingTimer);
+    window._chatThinkingTimer = null;
+  }}
+  const t = document.getElementById('chat-thinking');
+  if (t) t.remove();
 }}
 
 async function sendChat() {{
@@ -1628,13 +1633,13 @@ async function sendChat() {{
       }})
     }});
     const data = await resp.json();
-    document.getElementById('chat-thinking')?.remove();
+    removeChatThinking();
 
     const reply = data.reply || '（無回應）';
     appendChatMsg('assistant', reply);
     _chatHistory.push({{role:'assistant', content: reply}});
   }} catch(e) {{
-    document.getElementById('chat-thinking')?.remove();
+    removeChatThinking();
     appendChatMsg('assistant', '❌ 連線失敗：' + String(e));
   }}
   document.getElementById('chat-send-btn').disabled = false;
@@ -2110,9 +2115,10 @@ def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(No
       <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
       <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
       {version_select_html}
-      {version_select_html}
     </div>
-    <a href="/writer" class="btn btn-sm btn-ghost" style="text-decoration:none;flex-shrink:0">← 返回</a>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
+      <a href="/writer" class="btn btn-sm btn-ghost" style="text-decoration:none;flex-shrink:0">← 返回</a>
+    </div>
   </div>
   <div id="rendered" style="line-height:1.8;color:#cbd5e1;font-size:.95rem;max-width:100%;overflow:hidden;word-break:break-word"></div>
 </div>
@@ -2130,9 +2136,10 @@ def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(No
   <div style="display:flex;gap:10px;align-items:flex-end">
     <textarea id="reply-input" rows="2" placeholder="輸入回覆，例如：收到！我會調整第二段的邏輯…"
       style="flex:1;resize:vertical;min-height:60px;font-family:inherit;font-size:.87rem"
-      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendReply();}}">
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendReply();}}"
+      oninput="document.getElementById('reply-btn').disabled = !this.value.trim()">
     </textarea>
-    <button class="btn" id="reply-btn" onclick="sendReply()" style="background:#059669;white-space:nowrap">
+    <button class="btn" id="reply-btn" onclick="sendReply()" style="background:#059669;white-space:nowrap" disabled>
       ➤ 回覆
     </button>
   </div>
@@ -2159,12 +2166,57 @@ def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(No
   </form>
 </div>
 
+<!-- 固定懸浮的重新載入按鈕 -->
+<style>
+  .floating-reload {{
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    z-index: 100;
+    background: #3b1f6e;
+    color: #e2e8f0;
+    border: 1px solid #6d28d9;
+    border-radius: 50px;
+    padding: 10px 16px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    transition: background 0.2s, transform 0.2s;
+  }}
+  .floating-reload:hover {{
+    background: #4c1d95;
+    transform: translateY(-2px);
+  }}
+  @media(max-width:900px){{
+    .floating-reload {{ right: 20px; bottom: 20px; }}
+  }}
+</style>
+<button onclick="window.location.reload()" class="floating-reload">🔄 重新載入</button>
+
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({{ startOnLoad: false, theme: 'dark' }});
+
+function renderMermaid() {{
+  document.querySelectorAll('code.language-mermaid').forEach(function(code) {{
+    var pre = code.parentElement;
+    if (pre.tagName === 'PRE') {{
+      var div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = code.textContent;
+      pre.parentElement.replaceChild(div, pre);
+    }}
+  }});
+  mermaid.init(undefined, document.querySelectorAll('.mermaid'));
+}}
+</script>
 <script>
 const md = {content_escaped};
 const ARTICLE_ID = {article_id_json};
 const AUTHOR = {author_json};
 document.getElementById('rendered').innerHTML = marked.parse(md);
+renderMermaid();
 document.querySelectorAll('#rendered pre').forEach(p=>{{p.style.maxWidth='100%';p.style.overflowX='auto';}});
 
 function escHtml(s){{return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
@@ -2221,7 +2273,7 @@ async function sendReply(){{
     input.value = text;
     alert('送出失敗：'+String(e));
   }}
-  document.getElementById('reply-btn').disabled = false;
+  document.getElementById('reply-btn').disabled = !input.value.trim();
   document.getElementById('reply-input').focus();
   window._replySending = false;
 }}
@@ -2410,146 +2462,37 @@ def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[s
     article_id_json = json.dumps(article_id)
 
     body = f"""
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px">
-    <div style="min-width:0;flex:1">
-      <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
-      <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
-      {version_select_html}
-      {version_select_html}
-      {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
-    </div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
-      <a href="/articles/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">
-        ⬇ 下載 .md
-      </a>
-      <a href="/articles" class="btn btn-sm btn-ghost" style="text-decoration:none">
-        ← 回列表
-      </a>
-    </div>
-  </div>
-
-  <div id="rendered" style="
-    line-height:1.8;color:#cbd5e1;
-    font-size:.95rem;
-    max-width:100%;
-    overflow:hidden;
-    word-break:break-word;
-    overflow-wrap:break-word;
-  "></div>
-</div>
-
-<!-- ── 回饋對話視窗 ─────────────────────────────────────────────────── -->
-<div class="card" id="feedback-card">
-  <h2>💬 回饋給寫手蝦</h2>
-  <p style="font-size:.82rem;color:#64748b;margin-bottom:14px">
-    在這裡留下修改建議或回饋，寫手蝦登入後可看到你的訊息並回覆。
-  </p>
-
-  <!-- Message list -->
-  <div id="msg-list" style="
-    background:#0a0a0f;border:1px solid #1e2235;border-radius:10px;
-    padding:14px;min-height:80px;max-height:500px;overflow-y:auto;
-    margin-bottom:14px;font-size:.87rem;line-height:1.65
-  ">
-    <div id="msg-loading" style="color:#4b5563;text-align:center;padding:16px">載入中…</div>
-  </div>
-
-  <!-- Input -->
-  <div style="display:flex;gap:10px;align-items:flex-end">
-    <textarea id="fb-input" rows="2" placeholder="輸入回饋內容，例如：第二段邏輯有點跳，可以加一個過渡句…"
-      style="flex:1;resize:vertical;min-height:60px;font-family:inherit;font-size:.87rem"
-      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendFeedback();}}">
-    </textarea>
-    <button class="btn" id="fb-send-btn" onclick="sendFeedback()" style="white-space:nowrap">
-      ➤ 送出
-    </button>
-  </div>
-  <div style="font-size:.75rem;color:#475569;margin-top:6px">Enter 送出 ｜ Shift+Enter 換行</div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script>
-const md = {content_escaped};
-const ARTICLE_ID = {article_id_json};
-document.getElementById('rendered').innerHTML = marked.parse(md);
-// Wrap tables & pre in scroll containers
-document.querySelectorAll('#rendered table').forEach(function(t){{
-  if(!t.parentElement.classList.contains('table-wrap')){{
-    var w=document.createElement('div');
-    w.className='table-wrap';
-    w.style.overflowX='auto';
-    t.parentNode.insertBefore(w,t);w.appendChild(t);
-  }}
-}});
-document.querySelectorAll('#rendered pre').forEach(function(p){{
-  p.style.maxWidth='100%';p.style.overflowX='auto';p.style.boxSizing='border-box';
-}});
-
-// ── Feedback functions ──────────────────────────────────────────────────────
-function escHtml(s){{return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
-
-function renderMessages(msgs){{
-  const el = document.getElementById('msg-list');
-  if(!msgs||msgs.length===0){{
-    el.innerHTML='<div style="color:#4b5563;text-align:center;padding:16px">尚無訊息，成為第一個留言的人！</div>';
-    return;
-  }}
-  el.innerHTML = msgs.map(m => {{
-    const isOwner = m.role === 'owner';
-    const align = isOwner ? 'flex-end' : 'flex-start';
-    const bg = isOwner ? '#3b1f6e' : '#1a2e3e';
-    const border = isOwner ? '#6d28d9' : '#1e4060';
-    const label = isOwner ? '👑 景揚' : ('✍️ ' + escHtml(m.from||'寫手蝦'));
-    return `<div style="display:flex;flex-direction:column;align-items:${{align}};margin-bottom:12px">
-      <div style="font-size:.72rem;color:#4b5563;margin-bottom:4px">${{label}} &nbsp;·&nbsp; ${{escHtml(m.timestamp||'')}}</div>
-      <div style="max-width:85%;padding:10px 14px;border-radius:12px;background:${{bg}};border:1px solid ${{border}};color:#cbd5e1;word-break:break-word">
-        ${{marked.parse(m.content||'')}}
-      </div>
-    </div>`;
-  }}).join('');
-  el.scrollTop = el.scrollHeight;
-}}
-
-async function loadMessages(){{
-  try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include'}});
-    const d = await r.json();
-    renderMessages(d.messages||[]);
-  }}catch(e){{
-    document.getElementById('msg-list').innerHTML='<div style="color:#fca5a5">載入失敗：'+escHtml(String(e))+'</div>';
-  }}
-}}
-
-async function sendFeedback(){{
-  if(window._fbSending) return;
-  window._fbSending = true;
-  const input = document.getElementById('fb-input');
-  const text = input.value.trim();
-  if(!text){{ window._fbSending=false; return; }}
-  document.getElementById('fb-send-btn').disabled = true;
-  input.value = '';
-  try{{
-    const r = await fetch('/articles/' + ARTICLE_ID + '/messages', {{credentials:'include',
-      method: 'POST',
-      headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify({{role:'owner', content:text}})
-    }});
-    const d = await r.json();
-    renderMessages(d.messages||[]);
-  }}catch(e){{
-    input.value = text;
-    alert('送出失敗：'+String(e));
-  }}
-  document.getElementById('fb-send-btn').disabled = false;
-  document.getElementById('fb-input').focus();
-  window._fbSending = false;
-}}
-
-loadMessages();
-setInterval(loadMessages, 5000);
-</script>
 <style>
+  /* ── 三欄式文章頁版面覆蓋 ─────────────────────────────────────────── */
+  .container{{max-width:100%!important;padding:0!important;margin:0!important}}
+  .layout-flex{{gap:0!important;padding:0!important}}
+  .content-wrap{{padding:0!important}}
+  /* 文章主體寬度自動調整（左欄 216px + 右欄 334px + 各 8px 間距） */
+  #art-wrap{{padding:24px 342px 40px 224px}}
+  /* 左側目錄面板 */
+  #toc-panel{{
+    position:fixed;left:0;top:54px;
+    width:216px;height:calc(100vh - 54px);
+    overflow-y:auto;
+    background:#12152a;border-right:1px solid #2d3154;
+    padding:16px 10px;z-index:50;
+  }}
+  #toc-list a{{
+    display:block;color:#94a3b8;text-decoration:none;
+    font-size:.76rem;border-radius:4px;margin-bottom:3px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    transition:background .15s,color .15s;
+  }}
+  #toc-list a:hover{{background:#2d3154;color:#e2e8f0}}
+  #toc-list a.toc-active{{background:#3b1f6e;color:#c4b5fd}}
+  /* 右側對話面板 */
+  #chat-panel{{
+    position:fixed;right:0;top:54px;
+    width:334px;height:calc(100vh - 54px);
+    background:#12152a;border-left:1px solid #2d3154;
+    display:flex;flex-direction:column;z-index:50;
+  }}
+  /* 文章樣式 */
   #rendered{{max-width:100%;overflow-x:hidden;word-break:break-word;overflow-wrap:break-word}}
   #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em;word-break:break-word}}
   #rendered p{{margin-bottom:.9em}}
@@ -2565,14 +2508,301 @@ setInterval(loadMessages, 5000);
   #rendered th{{text-align:left;padding:8px 10px;background:#0f1117;color:#64748b;border-bottom:1px solid #2d3154}}
   #rendered td{{padding:8px 10px;border-bottom:1px solid #1e2235;vertical-align:top}}
   .card{{overflow:hidden}}
+  /* ── 手機版（<900px）退回單欄 ── */
+  @media(max-width:900px){{
+    #toc-panel{{display:none}}
+    #chat-panel{{position:static;width:100%;height:auto;border-left:none;border-top:1px solid #2d3154;margin-top:16px}}
+    #art-wrap{{padding:16px}}
+  }}
 </style>
+
+<!-- ① 左側固定目錄導覽 -->
+<div id="toc-panel">
+  <div style="font-size:.7rem;color:#64748b;font-weight:700;margin-bottom:12px;letter-spacing:.07em;text-transform:uppercase">📑 目錄</div>
+  <div id="toc-list"><div style="color:#4b5563;font-size:.74rem;padding:4px 8px">解析中…</div></div>
+</div>
+
+<!-- ② 右側固定對話面板 -->
+<div id="chat-panel">
+  <!-- 標題列（點擊展開/收合） -->
+  <div onclick="toggleChat()" style="padding:12px 16px;border-bottom:1px solid #2d3154;display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none;flex-shrink:0;background:#1a1d2e">
+    <span style="font-size:.9rem;font-weight:600;color:#a78bfa">🦐 與蝦蝦對話</span>
+    <button id="chat-toggle-btn" style="background:none;border:none;color:#64748b;font-size:1rem;cursor:pointer;padding:0 4px;line-height:1" title="展開/收合">▼</button>
+  </div>
+  <!-- 對話主體 -->
+  <div id="chat-body" style="flex:1;overflow:hidden;display:flex;flex-direction:column;padding:12px;min-height:0;background:#1a1d2e">
+    <p style="font-size:.73rem;color:#64748b;margin-bottom:10px;flex-shrink:0;line-height:1.5">
+      直接和蝦蝦對話，告訴她你的想法或修改需求；每篇文章對話獨立記錄。
+    </p>
+    <div id="msg-list" style="flex:1;overflow-y:auto;background:#0a0a0f;border:1px solid #1e2235;border-radius:8px;padding:10px;font-size:.82rem;line-height:1.6;margin-bottom:10px;min-height:80px">
+      <div id="msg-loading" style="color:#4b5563;text-align:center;padding:16px">載入中…</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:flex-end;flex-shrink:0">
+      <textarea id="fb-input" rows="2" placeholder="例如：第二段邏輯有點跳，可以加個過渡句…"
+        style="flex:1;resize:none;min-height:56px;font-family:inherit;font-size:.83rem"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendFeedback();}}">
+      </textarea>
+      <button class="btn btn-sm" id="fb-send-btn" onclick="sendFeedback()" style="white-space:nowrap;padding:10px 14px">➤ 送出</button>
+    </div>
+    <div style="font-size:.7rem;color:#475569;margin-top:6px;flex-shrink:0">Enter 送出 ｜ Shift+Enter 換行</div>
+  </div>
+</div>
+
+<!-- ③ 文章主體（左右 padding 讓固定面板不遮住內容） -->
+<div id="art-wrap">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px">
+      <div style="min-width:0;flex:1">
+        <h2 style="font-size:1.4rem;color:#e2e8f0;margin-bottom:6px;word-break:break-word">{am['title']}</h2>
+        <div style="font-size:.85rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+        {version_select_html}
+        {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
+        <a href="/articles/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ 下載 .md</a>
+        <a href="/articles" class="btn btn-sm btn-ghost" style="text-decoration:none">← 回列表</a>
+      </div>
+    </div>
+    <div id="rendered" style="line-height:1.8;color:#cbd5e1;font-size:.95rem;max-width:100%;overflow:hidden;word-break:break-word;overflow-wrap:break-word"></div>
+  </div>
+</div>
+
+<!-- 固定懸浮的重新載入按鈕 -->
+<style>
+  .floating-reload {{
+    position: fixed;
+    bottom: 30px;
+    right: 354px; /* chat panel is 334px */
+    z-index: 100;
+    background: #3b1f6e;
+    color: #e2e8f0;
+    border: 1px solid #6d28d9;
+    border-radius: 50px;
+    padding: 10px 16px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    transition: background 0.2s, transform 0.2s;
+  }}
+  .floating-reload:hover {{
+    background: #4c1d95;
+    transform: translateY(-2px);
+  }}
+  @media(max-width:900px){{
+    .floating-reload {{ right: 20px; bottom: 20px; }}
+  }}
+</style>
+<button onclick="window.location.reload()" class="floating-reload">🔄 重新載入</button>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({{startOnLoad:false,theme:'dark'}});
+function renderMermaid(){{
+  document.querySelectorAll('code.language-mermaid').forEach(function(code){{
+    var pre=code.parentElement;
+    if(pre.tagName==='PRE'){{
+      var div=document.createElement('div');div.className='mermaid';div.textContent=code.textContent;
+      pre.parentElement.replaceChild(div,pre);
+    }}
+  }});
+  mermaid.init(undefined,document.querySelectorAll('.mermaid'));
+}}
+</script>
+<script>
+const md = {content_escaped};
+const ARTICLE_ID = {article_id_json};
+
+// ── 渲染 Markdown ──────────────────────────────────────────────────────────
+document.getElementById('rendered').innerHTML = marked.parse(md);
+renderMermaid();
+document.querySelectorAll('#rendered table').forEach(function(t){{
+  if(!t.parentElement.classList.contains('table-wrap')){{
+    var w=document.createElement('div');w.className='table-wrap';w.style.overflowX='auto';
+    t.parentNode.insertBefore(w,t);w.appendChild(t);
+  }}
+}});
+document.querySelectorAll('#rendered pre').forEach(function(p){{
+  p.style.maxWidth='100%';p.style.overflowX='auto';p.style.boxSizing='border-box';
+}});
+
+// ── 目錄導覽 ───────────────────────────────────────────────────────────────
+function buildTOC(){{
+  const headings=document.querySelectorAll('#rendered h1,#rendered h2,#rendered h3');
+  const tocList=document.getElementById('toc-list');
+  if(!headings.length){{
+    tocList.innerHTML='<div style="color:#4b5563;font-size:.74rem;padding:4px 8px">（無章節標題）</div>';
+    return;
+  }}
+  tocList.innerHTML='';
+  headings.forEach(function(h,i){{
+    const id='toc-h-'+i;
+    h.id=id;
+    const level=parseInt(h.tagName[1]);
+    const a=document.createElement('a');
+    a.href='#'+id;
+    a.title=h.textContent;
+    a.textContent=h.textContent;
+    a.style.paddingLeft=((level-1)*12+8)+'px';
+    a.style.paddingTop='4px';
+    a.style.paddingBottom='4px';
+    a.style.paddingRight='8px';
+    a.addEventListener('click',function(e){{
+      e.preventDefault();
+      document.getElementById(id).scrollIntoView({{behavior:'smooth',block:'start'}});
+    }});
+    tocList.appendChild(a);
+  }});
+  updateTOCActive();
+}}
+
+function updateTOCActive(){{
+  const headings=Array.from(document.querySelectorAll('#rendered h1,#rendered h2,#rendered h3'));
+  const links=Array.from(document.querySelectorAll('#toc-list a'));
+  if(!headings.length)return;
+  let activeIdx=0;
+  headings.forEach(function(h,i){{if(h.getBoundingClientRect().top<=80)activeIdx=i;}});
+  links.forEach(function(a,i){{a.classList.toggle('toc-active',i===activeIdx);}});
+}}
+
+window.addEventListener('scroll',updateTOCActive,{{passive:true}});
+buildTOC();
+
+// ── 對話面板展開/收合 ──────────────────────────────────────────────────────
+var _chatOpen=true;
+function toggleChat(){{
+  _chatOpen=!_chatOpen;
+  document.getElementById('chat-body').style.display=_chatOpen?'flex':'none';
+  document.getElementById('chat-toggle-btn').textContent=_chatOpen?'▼':'▲';
+}}
+
+// ── 對話功能 ───────────────────────────────────────────────────────────────
+function escHtml(s){{return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+
+function renderMessages(msgs){{
+  const el=document.getElementById('msg-list');
+  if(!msgs||msgs.length===0){{
+    el.innerHTML='<div style="color:#4b5563;text-align:center;padding:16px">開始和蝦蝦對話吧！👆 在下方輸入你想說的話…</div>';
+    return;
+  }}
+  el.innerHTML=msgs.map(m=>{{
+    const isOwner=m.role==='owner';
+    const align=isOwner?'flex-end':'flex-start';
+    const bg=isOwner?'#3b1f6e':'#1a2e3e';
+    const border=isOwner?'#6d28d9':'#1e4060';
+    const label=isOwner?'👑 景揚':('🦐 '+escHtml(m.from||'蝦蝦'));
+    return `<div style="display:flex;flex-direction:column;align-items:${{align}};margin-bottom:12px">
+      <div style="font-size:.7rem;color:#4b5563;margin-bottom:3px">${{label}} · ${{escHtml(m.timestamp||'')}}</div>
+      <div style="max-width:90%;padding:8px 12px;border-radius:10px;background:${{bg}};border:1px solid ${{border}};color:#cbd5e1;word-break:break-word;font-size:.82rem">
+        ${{marked.parse(m.content||'')}}
+      </div>
+    </div>`;
+  }}).join('');
+  el.scrollTop=el.scrollHeight;
+}}
+
+function showThinking(){{
+  hideThinking();
+  const el=document.getElementById('msg-list');
+  const div=document.createElement('div');
+  div.id='thinking-indicator';
+  div.style.cssText='display:flex;flex-direction:column;align-items:flex-start;margin-bottom:12px';
+  div.innerHTML=
+    '<div style="font-size:.7rem;color:#4b5563;margin-bottom:3px">🦞 龍蝦</div>'
+    +'<div style="padding:8px 14px;border-radius:10px;background:#1a2e3e;border:1px solid #1e4060;'
+    +'color:#64748b;font-size:.82rem;display:flex;align-items:center;gap:8px">'
+    +'<span style="display:inline-block;width:14px;height:14px;border:2px solid #2d3154;'
+    +'border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></span>'
+    +'🦞 龍蝦正在思考中<span id="thinking-dot"></span>'
+    +'</div>';
+  el.appendChild(div);
+  el.scrollTop=el.scrollHeight;
+  // 動態省略號
+  let n=0;
+  window._thinkingDotTimer=setInterval(()=>{{
+    n=(n%3)+1;
+    const d=document.getElementById('thinking-dot');
+    if(d)d.textContent='.'.repeat(n);
+  }},500);
+}}
+
+function hideThinking(){{
+  if(window._thinkingDotTimer){{clearInterval(window._thinkingDotTimer);window._thinkingDotTimer=null;}}
+  const t=document.getElementById('thinking-indicator');if(t)t.remove();
+}}
+
+async function fetchMessages(){{
+  try{{
+    const r=await fetch('/articles/'+ARTICLE_ID+'/messages',{{credentials:'include'}});
+    const d=await r.json();return d.messages||[];
+  }}catch(e){{return null;}}
+}}
+
+async function loadMessages(){{
+  if(document.getElementById('thinking-indicator'))return;
+  try{{
+    const r=await fetch('/articles/'+ARTICLE_ID+'/messages',{{credentials:'include'}});
+    const d=await r.json();renderMessages(d.messages||[]);
+  }}catch(e){{
+    document.getElementById('msg-list').innerHTML='<div style="color:#fca5a5">載入失敗：'+escHtml(String(e))+'</div>';
+  }}
+}}
+
+async function sendFeedback(){{
+  if(window._fbSending)return;
+  window._fbSending=true;
+  const input=document.getElementById('fb-input');
+  const text=input.value.trim();
+  if(!text){{window._fbSending=false;return;}}
+  document.getElementById('fb-send-btn').disabled=true;
+  input.value='';
+  try{{
+    const r=await fetch('/articles/'+ARTICLE_ID+'/messages',{{credentials:'include',
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{role:'owner',content:text}})
+    }});
+    const d=await r.json();
+    const countAfterSend=(d.messages||[]).length;
+    renderMessages(d.messages||[]);
+    showThinking();
+    // 每 3 秒輪詢一次，最多等 6 分鐘（120 次），足夠讓 LLM 慢慢產出
+    let polls=0;
+    window._rapidPollTimer=setInterval(()=>{{
+      polls++;
+      fetchMessages().then(msgs=>{{
+        if(msgs&&msgs.length>countAfterSend){{
+          clearInterval(window._rapidPollTimer);
+          window._rapidPollTimer=null;
+          hideThinking();
+          renderMessages(msgs);
+        }}else if(polls>=120){{
+          clearInterval(window._rapidPollTimer);
+          window._rapidPollTimer=null;
+          hideThinking();
+        }}
+      }});
+    }},3000);
+  }}catch(e){{input.value=text;alert('送出失敗：'+String(e));}}
+  document.getElementById('fb-send-btn').disabled=false;
+  document.getElementById('fb-input').focus();
+  window._fbSending=false;
+}}
+
+loadMessages();
+setInterval(loadMessages,5000);
+</script>
 """
     return HTMLResponse(_base_html(body, f"{am['title']} — 文章庫"))
 
 @app.get("/articles/{article_id}/messages")
-def get_article_messages(article_id: str, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
+def get_article_messages(article_id: str, request: Request, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
     """Get messages for an article. Both owner and writer can read."""
-    if not _auth(rag_token) and not _auth_writer(writer_token):
+    is_owner = _auth(rag_token)
+    x_writer = request.headers.get("X-Writer-Token", "")
+    is_writer = _auth_writer(writer_token) or (x_writer and secrets.compare_digest(x_writer, WRITER_PASSWORD))
+    
+    if not is_owner and not is_writer:
         raise HTTPException(401, "Not authenticated")
     msgs = _article_messages.get(article_id, [])
     return {"article_id": article_id, "messages": msgs}
@@ -2627,9 +2857,10 @@ async def post_article_message(article_id: str, payload: dict, request: Request,
     return {"article_id": article_id, "messages": _article_messages[article_id]}
 
 @app.post("/articles/{article_id}/revise")
-async def writer_revise_article(article_id: str, writer_token: Optional[str] = Cookie(None), file: UploadFile = File(...), note: str = Form("")):
+async def writer_revise_article(article_id: str, request: Request, writer_token: Optional[str] = Cookie(None), file: UploadFile = File(...), note: str = Form("")):
     """Writer submits a revised version of an article."""
-    if not _auth_writer(writer_token):
+    x_writer = request.headers.get("X-Writer-Token", "")
+    if not _auth_writer(writer_token) and not (x_writer and secrets.compare_digest(x_writer, WRITER_PASSWORD)):
         raise HTTPException(401, "Not authenticated")
     am = next((a for a in _articlemeta if a["id"] == article_id), None)
     if not am:
@@ -2662,12 +2893,20 @@ async def writer_revise_article(article_id: str, writer_token: Optional[str] = C
         args=(am["title"], article_id, am.get("author", "寫手蝦"), f"📝 已提交修改版本\n修改說明：{revision_note}"),
         daemon=True,
     ).start()
+    
+    # Check if request accepts JSON, otherwise return HTML redirect
+    accept = request.headers.get("Accept", "")
+    if "application/json" in accept or x_writer:
+        return {"status": "ok", "article_id": article_id}
     return RedirectResponse(f"/writer/article/{article_id}?msg=修改版已送出！", status_code=303)
 
 
 @app.get("/articles/{article_id}/download")
-def article_download(article_id: str, rag_token: Optional[str] = Cookie(None)):
-    if not _auth(rag_token):
+def article_download(article_id: str, request: Request, rag_token: Optional[str] = Cookie(None), writer_token: Optional[str] = Cookie(None)):
+    x_writer = request.headers.get("X-Writer-Token", "")
+    is_writer = _auth_writer(writer_token) or (x_writer and secrets.compare_digest(x_writer, WRITER_PASSWORD))
+    
+    if not _auth(rag_token) and not is_writer:
         return RedirectResponse("/login")
     am = next((a for a in _articlemeta if a["id"] == article_id), None)
     if not am:
@@ -2691,3 +2930,784 @@ def article_delete(article_id: str, rag_token: Optional[str] = Cookie(None)):
     _articlemeta = [a for a in _articlemeta if a["id"] != article_id]
     _save_articlemeta()
     return RedirectResponse(f"/articles?msg=已刪除：{am['title']}", status_code=303)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  System Status — 授權與模型額度狀態總覽
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _invoke_gateway_tool(tool: str, args: dict = {}) -> dict:
+    """Call OpenClaw Gateway tools/invoke endpoint."""
+    payload = {"tool": tool, "args": args}
+    try:
+        req = urllib.request.Request(
+            f"{OPENCLAW_GATEWAY_URL}/tools/invoke",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+OPENCLAW_HOME = Path(os.path.expanduser("~/.openclaw"))
+
+
+def _read_openclaw_config() -> dict:
+    """Read openclaw.json config file directly."""
+    try:
+        cfg_path = OPENCLAW_HOME / "openclaw.json"
+        return json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    except Exception:
+        return {}
+
+
+def _read_cron_jobs() -> list:
+    """Read cron jobs from ~/.openclaw/cron/jobs.json."""
+    try:
+        cron_path = OPENCLAW_HOME / "cron" / "jobs.json"
+        if not cron_path.exists():
+            return []
+        data = json.loads(cron_path.read_text())
+        jobs = data.get("jobs", [])
+        result = []
+        for j in jobs:
+            state = j.get("state", {})
+            result.append({
+                "id": j.get("id", ""),
+                "name": j.get("name", ""),
+                "enabled": j.get("enabled", True),
+                "schedule": j.get("schedule", {}),
+                "agentId": j.get("agentId", "main"),
+                "sessionTarget": j.get("sessionTarget", ""),
+                "lastRunAtMs": state.get("lastRunAtMs"),
+                "nextRunAtMs": state.get("nextRunAtMs"),
+                "lastStatus": state.get("lastStatus", ""),
+                "lastError": state.get("lastError", ""),
+                "consecutiveErrors": state.get("consecutiveErrors", 0),
+            })
+        return result
+    except Exception as e:
+        return []
+
+
+def _check_credential_status(provider: str) -> dict:
+    """Check credential status from auth-profiles.json and github-copilot.token.json."""
+    import time as _time
+
+    auth_profiles_path = OPENCLAW_HOME / "agents" / "main" / "agent" / "auth-profiles.json"
+    try:
+        raw = json.loads(auth_profiles_path.read_text())
+        profiles = raw.get("profiles", {})
+    except Exception:
+        profiles = {}
+
+    # Find the profile matching this provider
+    matched = None
+    for _key, pval in profiles.items():
+        if pval.get("provider", "") == provider:
+            matched = pval
+            break
+
+    if not matched:
+        return {"exists": False, "valid": False}
+
+    # Extract token value
+    token_val = matched.get("token") or matched.get("key") or ""
+    exists = bool(token_val) and len(token_val) > 10
+    masked = (token_val[:8] + "…" + token_val[-4:]) if len(token_val) > 12 else "***"
+
+    if not exists:
+        return {"exists": False, "valid": False}
+
+    # GitHub Copilot: check expiry from dedicated token file
+    if provider == "github-copilot":
+        copilot_path = OPENCLAW_HOME / "credentials" / "github-copilot.token.json"
+        try:
+            cdata = json.loads(copilot_path.read_text())
+            expires_ms = cdata.get("expiresAt", 0)
+            expires_s = expires_ms / 1000
+            valid = expires_s == 0 or expires_s > _time.time() + 60
+            expires_str = (
+                datetime.fromtimestamp(expires_s, TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+                if expires_s > 0 else "—"
+            )
+            return {"exists": True, "valid": valid, "masked": masked, "expiresAt": expires_str}
+        except Exception:
+            return {"exists": True, "valid": True, "masked": masked, "expiresAt": "—"}
+
+    # Other providers: exists → valid
+    return {"exists": True, "valid": True, "masked": masked}
+
+
+def _collect_system_status() -> dict:
+    """Collect all system status information."""
+    now_ts = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Session status (model, tokens, cache, version) via Gateway
+    status_result = _invoke_gateway_tool("session_status", {})
+    status_text = ""
+    if status_result.get("ok"):
+        r = status_result.get("result", {})
+        details = r.get("details", {})
+        status_text = details.get("statusText", "")
+
+    # 2. Sessions list (active agents) via Gateway
+    sessions_result = _invoke_gateway_tool("sessions_list", {"activeMinutes": 120, "limit": 50})
+    sessions = []
+    if sessions_result.get("ok"):
+        r = sessions_result.get("result", {})
+        d = r.get("details", {})
+        raw_sessions = d.get("sessions", [])
+        for s in raw_sessions:
+            key = s.get("key", "")
+            parts = key.split(":")
+            agent_name = parts[1] if len(parts) > 1 else "unknown"
+            sessions.append({
+                "key": key,
+                "agent": agent_name,
+                "displayName": s.get("displayName", key),
+                "label": s.get("label", ""),
+                "model": s.get("model", "—"),
+                "totalTokens": s.get("totalTokens", 0),
+                "contextTokens": s.get("contextTokens", 0),
+                "channel": s.get("channel", "—"),
+                "updatedAt": s.get("updatedAt", 0),
+                "sessionId": s.get("sessionId", ""),
+            })
+
+    # 3. Cron jobs (from file system)
+    cron_jobs = _read_cron_jobs()
+
+    # 4. Parse status_text for quick stats (moved up, needed for auth inference)
+    quick_stats = {}
+    if status_text:
+        for line in status_text.split("\n"):
+            if "Tokens:" in line:
+                quick_stats["tokens"] = line.split("Tokens:")[-1].strip()
+            elif "Cache:" in line:
+                quick_stats["cache"] = line.split("Cache:")[-1].strip()
+            elif "Context:" in line:
+                quick_stats["context"] = line.split("Context:")[-1].strip()
+            elif "Model:" in line:
+                quick_stats["model"] = line.split("Model:")[-1].strip()
+            elif "OpenClaw" in line:
+                quick_stats["version"] = line.strip().lstrip("\U0001f99e").strip()
+            elif "Session:" in line:
+                quick_stats["session"] = line.split("Session:")[-1].strip()
+            elif "Runtime:" in line:
+                quick_stats["runtime"] = line.split("Runtime:")[-1].strip()
+            elif "Queue:" in line:
+                quick_stats["queue"] = line.split("Queue:")[-1].strip()
+
+    # 5. OpenClaw config — auth profiles (from file system)
+    cfg = _read_openclaw_config()
+    auth_profiles = []
+    profiles = cfg.get("auth", {}).get("profiles", {})
+    # Infer anthropic validity from session_status success
+    anthropic_valid_from_status = bool(quick_stats.get("model", "").startswith("anthropic/"))
+    for profile_key, profile_val in profiles.items():
+        provider = profile_val.get("provider", "")
+        mode = profile_val.get("mode", "—")
+        cred_status = _check_credential_status(provider)
+        # For anthropic: if session_status used anthropic model, cred is valid
+        if provider == "anthropic" and not cred_status.get("valid") and anthropic_valid_from_status:
+            cred_status["valid"] = True
+            cred_status["exists"] = True
+            cred_status["masked"] = "sk-ant-***…*** (正在使用)"
+        auth_profiles.append({
+            "id": profile_key,
+            "provider": provider,
+            "mode": mode,
+            "credExists": cred_status.get("exists", False),
+            "credValid": cred_status.get("valid", False),
+            "credMasked": cred_status.get("masked", "—"),
+            "credExpires": cred_status.get("expiresAt", ""),
+        })
+
+    # 6. Services status (local systemd)
+    services = []
+    service_names = ["rag-kb", "rag-embed", "openclaw"]
+    for svc in service_names:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", svc],
+                capture_output=True, text=True, timeout=3
+            )
+            status_str = result.stdout.strip()
+            services.append({"name": svc, "status": status_str, "ok": status_str == "active"})
+        except Exception:
+            services.append({"name": svc, "status": "unknown", "ok": False})
+
+    # 7. Model fallback list (from config)
+    model_fallbacks = []
+    agents_defaults = cfg.get("agents", {}).get("defaults", {})
+    primary = agents_defaults.get("model", {}).get("primary", "")
+    fallbacks = agents_defaults.get("model", {}).get("fallbacks", [])
+    if primary:
+        model_fallbacks.append({"model": primary, "role": "primary"})
+    for fb in fallbacks:
+        model_fallbacks.append({"model": fb, "role": "fallback"})
+
+    # 8. LLM Proxy status + backends
+    llm_proxy_ok = False
+    llm_proxy_backends = {}
+    try:
+        req = urllib.request.Request("http://127.0.0.1:9000/health", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                llm_proxy_ok = True
+                proxy_data = json.loads(resp.read())
+                llm_proxy_backends = proxy_data.get("backends", {})
+    except Exception:
+        pass
+    services.append({"name": "llm-proxy (port 9000)", "status": "active" if llm_proxy_ok else "inactive", "ok": llm_proxy_ok})
+
+    # 9. WhatsApp session status
+    wa_dir = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
+    wa_status = {"exists": False, "hasCreds": False, "fileCount": 0}
+    if wa_dir.exists():
+        wa_files = list(wa_dir.iterdir())
+        wa_status = {
+            "exists": True,
+            "hasCreds": (wa_dir / "creds.json").exists(),
+            "fileCount": len(wa_files),
+        }
+
+    # 10. Twilio config (from openclaw.json voice-call plugin)
+    twilio_info = {}
+    vc_plugin = cfg.get("plugins", {}).get("entries", {}).get("voice-call", {})
+    if vc_plugin.get("enabled"):
+        vc_cfg = vc_plugin.get("config", {})
+        tw = vc_cfg.get("twilio", {})
+        sid = tw.get("accountSid", "")
+        twilio_info = {
+            "enabled": True,
+            "accountSidMasked": (sid[:6] + "…" + sid[-4:]) if len(sid) > 10 else sid,
+            "fromNumber": vc_cfg.get("fromNumber", "—"),
+            "webhookUrl": vc_cfg.get("publicUrl", "—"),
+        }
+
+    # 11. Agent model config (from agents.list)
+    agent_configs = []
+    for entry in cfg.get("agents", {}).get("list", []):
+        agent_id = entry.get("id", "?")
+        model = entry.get("model") or cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "—")
+        agent_configs.append({
+            "id": agent_id,
+            "name": entry.get("name") or entry.get("identity", {}).get("name") or agent_id,
+            "model": model,
+        })
+
+    # 12. Context window settings
+    defaults_cfg = cfg.get("agents", {}).get("defaults", {})
+    context_settings = {
+        "pruningMode": defaults_cfg.get("contextPruning", {}).get("mode", "—"),
+        "pruningTtl": defaults_cfg.get("contextPruning", {}).get("ttl", "—"),
+        "compactionMode": defaults_cfg.get("compaction", {}).get("mode", "—"),
+        "memoryFlush": defaults_cfg.get("compaction", {}).get("memoryFlush", {}).get("enabled", False),
+        "subagentMaxConcurrent": defaults_cfg.get("subagents", {}).get("maxConcurrent", "—"),
+        "subagentArchiveMin": defaults_cfg.get("subagents", {}).get("archiveAfterMinutes", "—"),
+    }
+
+    return {
+        "collectedAt": now_ts,
+        "statusText": status_text,
+        "quickStats": quick_stats,
+        "authProfiles": auth_profiles,
+        "sessions": sessions,
+        "cronJobs": cron_jobs,
+        "services": services,
+        "modelFallbacks": model_fallbacks,
+        "llmProxyBackends": llm_proxy_backends,
+        "whatsappStatus": wa_status,
+        "twilioInfo": twilio_info,
+        "agentConfigs": agent_configs,
+        "contextSettings": context_settings,
+    }
+
+
+@app.get("/api/sys_status")
+def api_sys_status(rag_token: Optional[str] = Cookie(None)):
+    """JSON API: collect and return full system status."""
+    if not _auth(rag_token):
+        raise HTTPException(401, "Not authenticated")
+    try:
+        data = _collect_system_status()
+        return data
+    except Exception as e:
+        raise HTTPException(500, f"Status collection failed: {e}")
+
+
+@app.get("/sys_status", response_class=HTMLResponse)
+def sys_status_page(rag_token: Optional[str] = Cookie(None)):
+    """System status overview page."""
+    if not _auth(rag_token):
+        return RedirectResponse("/login")
+
+    body = r"""
+<style>
+  .status-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:18px}
+  .status-card{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:20px}
+  .status-card h3{font-size:.9rem;font-weight:600;color:#a78bfa;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+  .stat-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #1e2235;font-size:.84rem}
+  .stat-row:last-child{border-bottom:none}
+  .stat-label{color:#64748b}
+  .stat-val{color:#e2e8f0;font-family:monospace;font-size:.82rem;text-align:right;max-width:60%;word-break:break-all}
+  .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .dot-green{background:#22c55e}
+  .dot-red{background:#ef4444}
+  .dot-yellow{background:#f59e0b}
+  .dot-gray{background:#6b7280}
+  .badge-model{background:#1e3a5f;color:#93c5fd;border-radius:6px;padding:2px 8px;font-size:.74rem;font-family:monospace}
+  .badge-primary{background:#3b1f6e;color:#c4b5fd;border-radius:6px;padding:2px 8px;font-size:.74rem;font-family:monospace}
+  .badge-ok{background:#052e16;color:#86efac;border-radius:6px;padding:2px 7px;font-size:.75rem}
+  .badge-err{background:#450a0a;color:#fca5a5;border-radius:6px;padding:2px 7px;font-size:.75rem}
+  .badge-warn{background:#422006;color:#fde68a;border-radius:6px;padding:2px 7px;font-size:.75rem}
+  .refresh-bar{display:flex;align-items:center;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+  .refresh-bar .last-updated{font-size:.8rem;color:#64748b}
+  #loading-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,17,23,.7);z-index:999;
+    display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+  #loading-overlay.hidden{display:none}
+  .session-row{padding:8px 0;border-bottom:1px solid #1e2235;font-size:.82rem}
+  .session-row:last-child{border-bottom:none}
+  .session-key{color:#94a3b8;font-family:monospace;font-size:.75rem;word-break:break-all}
+  .session-meta{color:#64748b;font-size:.74rem;margin-top:2px}
+  .cron-row{padding:8px 0;border-bottom:1px solid #1e2235;font-size:.82rem}
+  .cron-row:last-child{border-bottom:none}
+  .model-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #1e2235;font-size:.82rem}
+  .model-row:last-child{border-bottom:none}
+  .status-text-box{background:#0a0a0f;border:1px solid #1e2235;border-radius:8px;padding:12px;
+    font-family:monospace;font-size:.8rem;color:#94a3b8;white-space:pre-wrap;line-height:1.7}
+  @media(max-width:640px){
+    .status-grid{grid-template-columns:1fr}
+    .stat-val{max-width:55%}
+  }
+</style>
+
+<!-- Loading overlay -->
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <div style="color:#94a3b8;font-size:.9rem">載入系統狀態中，請稍候…</div>
+</div>
+
+<div class="refresh-bar">
+  <button class="btn" id="refresh-btn" onclick="refreshStatus()">🔄 立即刷新</button>
+  <label style="display:flex;align-items:center;gap:8px;font-size:.85rem;color:#94a3b8;cursor:pointer">
+    <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()" style="width:auto">
+    每 30 秒自動刷新
+  </label>
+  <div class="last-updated" id="last-updated">— 尚未載入 —</div>
+</div>
+
+<div id="status-container">
+  <!-- 由 JS 動態填入 -->
+</div>
+
+<script>
+let _autoTimer = null;
+let _statusData = null;
+
+function toggleAutoRefresh() {
+  const checked = document.getElementById('auto-refresh').checked;
+  if (checked) {
+    _autoTimer = setInterval(refreshStatus, 30000);
+  } else {
+    if (_autoTimer) { clearInterval(_autoTimer); _autoTimer = null; }
+  }
+}
+
+function escHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function fmtTs(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return d.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+}
+
+function dotClass(ok) {
+  return ok ? 'dot-green' : 'dot-red';
+}
+
+function renderStatus(data) {
+  const qs = data.quickStats || {};
+  const container = document.getElementById('status-container');
+
+  // ── 快速統計行 ───────────────────────────────────────────────────────────
+  const quickRows = [
+    ['版本', qs.version || '—'],
+    ['目前 Session', qs.session || '—'],
+    ['主要模型', qs.model || '—'],
+    ['Token 使用', qs.tokens || '—'],
+    ['Cache 命中', qs.cache || '—'],
+    ['Context 使用', qs.context || '—'],
+    ['Runtime', qs.runtime || '—'],
+  ].map(([k, v]) => `<div class="stat-row"><span class="stat-label">${k}</span><span class="stat-val">${escHtml(v)}</span></div>`).join('');
+
+  // ── 授權設定 ─────────────────────────────────────────────────────────────
+  const authRows = (data.authProfiles || []).map(p => {
+    let badge;
+    if (p.credExists && p.credValid) {
+      badge = '<span class="badge-ok">✓ 有效</span>';
+    } else if (p.credExists && !p.credValid) {
+      badge = '<span class="badge-warn">⚠ 已過期</span>';
+    } else {
+      badge = '<span class="badge-err">✗ 未設定</span>';
+    }
+    const expiryLine = p.credExpires && p.credExpires !== '—'
+      ? `<div style="font-size:.7rem;color:#64748b;margin-top:2px">到期：${escHtml(p.credExpires)}</div>`
+      : '';
+    return `<div class="stat-row">
+      <span class="stat-label">${escHtml(p.id)}</span>
+      <span class="stat-val" style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+        <span style="display:flex;align-items:center;gap:6px">
+          <span style="color:#64748b;font-size:.74rem">${escHtml(p.provider)} / ${escHtml(p.mode)}</span>
+          ${badge}
+        </span>
+        ${expiryLine}
+      </span>
+    </div>`;
+  }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無授權設定</span></div>';
+
+  // ── 服務狀態 ─────────────────────────────────────────────────────────────
+  const svcRows = (data.services || []).map(s => {
+    const badge = s.ok ? '<span class="badge-ok">● active</span>' : `<span class="badge-err">● ${escHtml(s.status)}</span>`;
+    return `<div class="stat-row">
+      <span class="stat-label" style="display:flex;align-items:center;gap:7px">
+        <span class="dot ${s.ok ? 'dot-green' : 'dot-red'}"></span>${escHtml(s.name)}
+      </span>
+      ${badge}
+    </div>`;
+  }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無服務資訊</span></div>';
+
+  // ── 模型清單 ─────────────────────────────────────────────────────────────
+  const modelRows = (data.modelFallbacks || []).slice(0, 12).map((m, i) => {
+    const isPrimary = m.role === 'primary';
+    const badge = isPrimary
+      ? '<span class="badge-primary">★ Primary</span>'
+      : `<span style="color:#4b5563;font-size:.72rem">#${i}</span>`;
+    return `<div class="model-row">
+      ${badge}
+      <span class="badge-model">${escHtml(m.model)}</span>
+    </div>`;
+  }).join('') || '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無模型設定</div>';
+  const modelCount = (data.modelFallbacks || []).length;
+
+  // ── Active Sessions ───────────────────────────────────────────────────────
+  // Group by agent
+  const sessionsByAgent = {};
+  (data.sessions || []).forEach(s => {
+    if (!sessionsByAgent[s.agent]) sessionsByAgent[s.agent] = [];
+    sessionsByAgent[s.agent].push(s);
+  });
+
+  const agentColors = {
+    main: '#a78bfa', engineer: '#60a5fa', writer: '#34d399',
+    hb: '#fbbf24', default: '#94a3b8'
+  };
+
+  let sessionRows = '';
+  Object.entries(sessionsByAgent).forEach(([agent, sessions]) => {
+    const color = agentColors[agent] || agentColors.default;
+    // Only show the most recent session per agent key
+    const mainSessions = sessions.filter(s => s.key.endsWith(':main'));
+    const displaySessions = mainSessions.length ? mainSessions : sessions.slice(0, 1);
+    displaySessions.forEach(s => {
+      const tokPct = s.contextTokens ? Math.round(s.totalTokens / s.contextTokens * 100) : 0;
+      const tokBar = s.contextTokens ? `
+        <div style="height:3px;background:#1e2235;border-radius:2px;margin-top:4px;overflow:hidden">
+          <div style="height:100%;background:${color};width:${Math.min(tokPct,100)}%;border-radius:2px;transition:width .5s"></div>
+        </div>` : '';
+      sessionRows += `<div class="session-row">
+        <div style="display:flex;align-items:center;gap:7px">
+          <span style="color:${color};font-weight:600;font-size:.82rem">[${escHtml(agent)}]</span>
+          <span class="badge-model">${escHtml(s.model)}</span>
+          ${s.label ? `<span style="color:#64748b;font-size:.72rem">${escHtml(s.label)}</span>` : ''}
+        </div>
+        <div class="session-key">${escHtml(s.key)}</div>
+        ${s.totalTokens ? `<div class="session-meta">Tokens: ${s.totalTokens.toLocaleString()} / ${(s.contextTokens||0).toLocaleString()} (${tokPct}%)${tokBar}</div>` : ''}
+        ${s.updatedAt ? `<div class="session-meta">更新：${fmtTs(s.updatedAt)}</div>` : ''}
+      </div>`;
+    });
+  });
+  if (!sessionRows) sessionRows = '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無活躍 Session</div>';
+
+  // ── 費用估算 ──────────────────────────────────────────────────────────────
+  function resolveProvider(model) {
+    const m = (model || '').toLowerCase();
+    if (m.startsWith('anthropic/') || m.includes('claude')) return 'anthropic';
+    if (m.startsWith('github-copilot/')) return 'github-copilot';
+    if (m.startsWith('google-vertex/') || m.startsWith('google/') || m.includes('gemini')) return 'google';
+    if (m.startsWith('openai/') || m.includes('gpt-')) return 'openai';
+    return 'other';
+  }
+  function modelCost(model, tokens) {
+    const m = (model || '').toLowerCase();
+    let inPrice = 0, outPrice = 0, label = null;
+    // Anthropic
+    if (m.includes('claude-opus-4') || m.includes('claude-opus-4.6')) { inPrice = 15.0; outPrice = 75.0; }
+    else if (m.includes('claude-sonnet-4') || m.includes('claude-sonnet-4.6') || m.includes('claude-sonnet-4-6')) { inPrice = 3.0; outPrice = 15.0; }
+    else if (m.includes('sonnet')) { inPrice = 3.0; outPrice = 15.0; }
+    else if (m.includes('opus')) { inPrice = 15.0; outPrice = 75.0; }
+    else if (m.includes('haiku')) { inPrice = 0.25; outPrice = 1.25; }
+    // OpenAI
+    else if (m.includes('gpt-5') && !m.includes('mini')) { inPrice = 10.0; outPrice = 30.0; }
+    else if (m.includes('gpt-5-mini') || m.includes('gpt-5.2-mini') || m.includes('gpt-4o-mini')) { inPrice = 0.15; outPrice = 0.6; }
+    else if (m.includes('gpt-4o')) { inPrice = 2.5; outPrice = 10.0; }
+    else if (m.includes('gpt-4')) { inPrice = 30.0; outPrice = 60.0; }
+    // GitHub Copilot — 訂閱制
+    else if (m.startsWith('github-copilot/')) { label = '訂閱制'; }
+    // Google — 依方案
+    else if (m.startsWith('google/') || m.startsWith('google-vertex/') || m.includes('gemini')) { label = 'Google (依方案)'; }
+    if (label !== null) return { cost: 0, label };
+    const cost = (tokens * 0.3 / 1e6) * inPrice + (tokens * 0.7 / 1e6) * outPrice;
+    return { cost, label: null };
+  }
+  const costSessions = (data.sessions || []).filter(s => (s.totalTokens || 0) > 0);
+  // 按 provider 分開累計費用
+  const providerCosts = {};
+  let costRows = '';
+  for (const s of costSessions) {
+    const tokens = s.totalTokens || 0;
+    const { cost, label } = modelCost(s.model, tokens);
+    const provider = resolveProvider(s.model);
+    if (cost > 0) {
+      providerCosts[provider] = (providerCosts[provider] || 0) + cost;
+    }
+    const costStr = label ? `<span style="color:#64748b">${label}</span>`
+      : cost > 0 ? `<span style="color:#fde68a">$${cost.toFixed(4)}</span>`
+      : '<span style="color:#4b5563">$0.0000</span>';
+    const keyShort = (s.key || s.sessionKey || '—').slice(0, 30);
+    const modelShort = (s.model || '—').slice(0, 28);
+    costRows += `<tr>
+      <td style="padding:6px 10px;font-size:.82rem;color:#94a3b8;font-family:monospace">${escHtml(keyShort)}</td>
+      <td style="padding:6px 10px;font-size:.78rem;color:#64748b">${escHtml(modelShort)}</td>
+      <td style="padding:6px 10px;font-size:.82rem;color:#e2e8f0;text-align:right">${tokens.toLocaleString()}</td>
+      <td style="padding:6px 10px;font-size:.82rem;text-align:right">${costStr}</td>
+    </tr>`;
+  }
+  // 合計列 — 每個有費用的 provider 各顯示一行
+  const providerLabels = { anthropic: 'Anthropic', openai: 'OpenAI', google: 'Google', 'github-copilot': 'GitHub Copilot', other: 'Other' };
+  let footerRows = '';
+  const hasCost = Object.keys(providerCosts).length > 0;
+  if (hasCost) {
+    for (const [prov, total] of Object.entries(providerCosts)) {
+      footerRows += `<tr style="border-top:1px solid #2d3154;background:#0f1117">
+        <td colspan="3" style="padding:6px 10px;font-size:.84rem;color:#a78bfa;font-weight:600">合計 ${providerLabels[prov] || prov} 費用</td>
+        <td style="padding:6px 10px;text-align:right;font-size:.88rem;font-weight:700;color:#fde68a">$${total.toFixed(4)} USD</td>
+      </tr>`;
+    }
+  }
+  const costCard = costSessions.length === 0
+    ? '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無 Token 使用紀錄</div>'
+    : `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.84rem">
+        <thead><tr style="background:#0f1117">
+          <th style="padding:6px 10px;text-align:left;color:#64748b;font-weight:500">Session</th>
+          <th style="padding:6px 10px;text-align:left;color:#64748b;font-weight:500">Model</th>
+          <th style="padding:6px 10px;text-align:right;color:#64748b;font-weight:500">Tokens</th>
+          <th style="padding:6px 10px;text-align:right;color:#64748b;font-weight:500">費用估算</th>
+        </tr></thead>
+        <tbody>${costRows}</tbody>
+        ${hasCost ? `<tfoot>${footerRows}</tfoot>` : ''}
+      </table></div>`;
+
+  // ── Cron Jobs ─────────────────────────────────────────────────────────────
+  const cronRows = (data.cronJobs || []).map(j => {
+    const en = j.enabled !== false;
+    const badge = en ? '<span class="badge-ok">✓ 啟用</span>' : '<span class="badge-warn">⏸ 停用</span>';
+    const schedText = j.schedule?.kind === 'cron' ? j.schedule.expr
+      : j.schedule?.kind === 'every' ? `每 ${Math.round((j.schedule.everyMs||0)/60000)} 分`
+      : j.schedule?.kind === 'at' ? j.schedule.at
+      : JSON.stringify(j.schedule || {});
+    return `<div class="cron-row">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <span style="color:#e2e8f0;font-size:.84rem;flex:1;min-width:0;word-break:break-word">${escHtml(j.name || j.id)}</span>
+        ${badge}
+      </div>
+      <div style="font-size:.74rem;color:#64748b;margin-top:3px">
+        ⏰ ${escHtml(schedText)}
+        ${j.lastRunAt ? ' &nbsp;·&nbsp; 上次：' + fmtTs(j.lastRunAt) : ''}
+      </div>
+    </div>`;
+  }).join('') || '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無排程任務</div>';
+
+  // ── LLM Proxy Backends ────────────────────────────────────────────────────
+  const backends = data.llmProxyBackends || {};
+  const proxyBackendRows = Object.entries(backends).map(([name, b]) => {
+    const enabled = b.enabled !== false;
+    let badge;
+    if (enabled && b.token_valid !== false) badge = '<span class="badge-ok">✓ 啟用</span>';
+    else if (enabled && b.token_valid === false) badge = '<span class="badge-warn">⚠ Token 無效</span>';
+    else badge = '<span class="badge-err">✗ 已停用</span>';
+    return `<div class="stat-row">
+      <span class="stat-label" style="display:flex;align-items:center;gap:7px">
+        <span class="dot ${enabled ? 'dot-green' : 'dot-red'}"></span>${escHtml(name)}
+      </span>${badge}</div>`;
+  }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無法讀取後端狀態</span></div>';
+
+  // ── WhatsApp 狀態 ─────────────────────────────────────────────────────────
+  const wa = data.whatsappStatus || {};
+  const waBadge = wa.hasCreds
+    ? `<span class="badge-ok">✓ Session 已建立</span>`
+    : wa.exists
+      ? `<span class="badge-warn">⚠ 目錄存在但無 creds</span>`
+      : `<span class="badge-err">✗ 未配對</span>`;
+  const waRows = `<div class="stat-row"><span class="stat-label">Session 目錄</span>${waBadge}</div>
+    <div class="stat-row"><span class="stat-label">Session 檔案數</span><span class="stat-val">${wa.fileCount || 0}</span></div>`;
+
+  // ── Twilio 狀態 ──────────────────────────────────────────────────────────
+  const tw = data.twilioInfo || {};
+  const twilioRows = tw.enabled
+    ? `<div class="stat-row"><span class="stat-label">Account SID</span><span class="stat-val" style="font-family:monospace">${escHtml(tw.accountSidMasked||'—')}</span></div>
+       <div class="stat-row"><span class="stat-label">發話號碼</span><span class="stat-val">${escHtml(tw.fromNumber||'—')}</span></div>
+       <div class="stat-row"><span class="stat-label">Webhook URL</span><span class="stat-val" style="font-size:.74rem;word-break:break-all">${escHtml(tw.webhookUrl||'—')}</span></div>`
+    : '<div class="stat-row"><span class="stat-label" style="color:#4b5563">Voice-call plugin 未啟用</span></div>';
+
+  // ── Agent 模型配置 ────────────────────────────────────────────────────────
+  const agentConfigRows = (data.agentConfigs || []).map(a => {
+    const isPremium = (a.model||'').includes('claude') || (a.model||'').includes('sonnet') || (a.model||'').includes('opus');
+    const modelBadge = isPremium
+      ? `<span class="badge-primary">${escHtml(a.model||'—')}</span>`
+      : `<span class="badge-model">${escHtml(a.model||'—')}</span>`;
+    return `<div class="stat-row">
+      <span class="stat-label">🦐 ${escHtml(a.name||a.id)}</span>
+      <span class="stat-val">${modelBadge}</span></div>`;
+  }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無 Agent 設定</span></div>';
+
+  // ── Context 設定 ─────────────────────────────────────────────────────────
+  const cs = data.contextSettings || {};
+  const ctxRows = [
+    ['Pruning 模式', cs.pruningMode || '—'],
+    ['Pruning TTL', cs.pruningTtl || '—'],
+    ['Compaction 模式', cs.compactionMode || '—'],
+    ['Memory Flush', cs.memoryFlush ? '✓ 啟用' : '✗ 停用'],
+    ['Subagent 最大並發', String(cs.subagentMaxConcurrent ?? '—')],
+    ['Subagent 封存時限', cs.subagentArchiveMin ? cs.subagentArchiveMin + ' 分鐘' : '—'],
+  ].map(([k,v]) => `<div class="stat-row"><span class="stat-label">${k}</span><span class="stat-val">${escHtml(v)}</span></div>`).join('');
+
+  // ── 頂端異常警告條 ────────────────────────────────────────────────────────
+  const alerts = [];
+  if (backends.anthropic && backends.anthropic.enabled === false) {
+    alerts.push('⚠️ <strong>LLM Proxy Anthropic backend 已停用</strong>：Anthropic 請求走 Gateway 直連，無 proxy 層備援。');
+  }
+  (data.authProfiles || []).forEach(p => {
+    if (p.credExists && !p.credValid) {
+      alerts.push(`⚠️ <strong>${escHtml(p.provider)}</strong> 授權已失效，請重新設定。`);
+    } else if (!p.credExists && p.provider !== 'whatsapp') {
+      alerts.push(`⚠️ <strong>${escHtml(p.provider)}</strong> 授權未設定。`);
+    }
+  });
+  const alertBanner = alerts.length > 0
+    ? alerts.map(a => `<div style="background:#422006;border:1px solid #92400e;color:#fde68a;border-radius:8px;padding:10px 14px;font-size:.84rem;margin-bottom:8px">${a}</div>`).join('')
+    : '';
+
+  // ── Status Raw Text ───────────────────────────────────────────────────────
+  const rawText = data.statusText ? `
+    <div class="status-card" style="margin-top:18px">
+      <h3>📋 完整狀態原文</h3>
+      <div class="status-text-box">${escHtml(data.statusText)}</div>
+    </div>` : '';
+
+  // ── Assemble ──────────────────────────────────────────────────────────────
+  container.innerHTML = `
+    ${alertBanner}
+    <div class="status-grid">
+
+      <div class="status-card">
+        <h3>⚡ 快速統計</h3>
+        ${quickRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🔐 授權設定（${(data.authProfiles||[]).length} 個）</h3>
+        ${authRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🖧 服務狀態</h3>
+        ${svcRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🔀 LLM Proxy Backends</h3>
+        ${proxyBackendRows}
+      </div>
+
+      <div class="status-card">
+        <h3>📱 WhatsApp 狀態</h3>
+        ${waRows}
+      </div>
+
+      <div class="status-card">
+        <h3>📞 Twilio 語音通話</h3>
+        ${twilioRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🤖 模型清單（${modelCount} 個）</h3>
+        <div style="max-height:260px;overflow-y:auto">${modelRows}</div>
+      </div>
+
+      <div class="status-card">
+        <h3>🦐 Agent 模型配置</h3>
+        ${agentConfigRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🪟 Context 視窗設定</h3>
+        ${ctxRows}
+      </div>
+
+      <div class="status-card" style="grid-column:1/-1">
+        <h3>🦐 Agent Sessions</h3>
+        <div style="max-height:360px;overflow-y:auto">${sessionRows}</div>
+      </div>
+
+      <div class="status-card" style="grid-column:1/-1">
+        <h3>💰 Token 費用估算</h3>
+        ${costCard}
+      </div>
+
+      <div class="status-card" style="grid-column:1/-1">
+        <h3>⏰ Cron Jobs（${(data.cronJobs||[]).length} 個）</h3>
+        <div style="max-height:300px;overflow-y:auto">${cronRows}</div>
+      </div>
+
+    </div>
+    ${rawText}
+  `;
+
+  document.getElementById('last-updated').textContent = '最後更新：' + data.collectedAt + ' (Asia/Taipei)';
+}
+
+async function refreshStatus() {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 載入中…';
+  document.getElementById('loading-overlay').classList.remove('hidden');
+  try {
+    const r = await fetch('/api/sys_status', { credentials: 'include' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    _statusData = await r.json();
+    renderStatus(_statusData);
+  } catch(e) {
+    document.getElementById('status-container').innerHTML =
+      `<div class="alert alert-error">❌ 載入失敗：${e.message}</div>`;
+  } finally {
+    document.getElementById('loading-overlay').classList.add('hidden');
+    btn.disabled = false;
+    btn.textContent = '🔄 立即刷新';
+  }
+}
+
+// Initial load
+refreshStatus();
+</script>
+"""
+    return HTMLResponse(_base_html(body, "系統狀態 — RAG KB"))

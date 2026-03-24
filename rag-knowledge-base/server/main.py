@@ -210,7 +210,8 @@ def _ask_writer_agent(article_id: str, owner_message: str):
         "tool": "sessions_send",
         "args": {
             "sessionKey": WRITER_SESSION_KEY,
-            "message": prompt
+            "message": prompt,
+            "timeoutSeconds": 0
         }
     }
     try:
@@ -296,7 +297,8 @@ article_title: str, article_id: str, writer_name: str, reply_content: str) -> bo
                 f"📄 文章：**{article_title}**\n"
                 f"💬 回覆：{reply_content}\n\n"
                 f"👉 查看文章：{article_url}"
-            )
+            ),
+            "timeoutSeconds": 0
         }
     }
     try:
