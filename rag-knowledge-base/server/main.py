@@ -1989,7 +1989,17 @@ async def writer_api_submit(request: Request):
     x_token = request.headers.get("X-Writer-Token", "")
     if not secrets.compare_digest(x_token, WRITER_PASSWORD):
         raise HTTPException(401, "Invalid writer token")
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"JSON parse error: {e}. "
+            "Hint: If submitting via curl shell, use a temp file to avoid shell escaping issues. "
+            "Example: echo '{\"title\":\"T\",\"author\":\"A\",\"content\":\"...\"}' > /tmp/p.json && "
+            "curl -X POST .../writer/api/submit -H 'Content-Type: application/json' "
+            "-H 'X-Writer-Token: writer123' --data-binary @/tmp/p.json"
+        )
     title   = (payload.get("title") or "").strip()
     author  = (payload.get("author") or "").strip()
     content = (payload.get("content") or "").strip()
