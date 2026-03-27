@@ -37,9 +37,22 @@ WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "")
 # ── Articles (writer uploads) ─────────────────────────────────────────────────
 ARTICLES_DIR      = DATA_DIR / "articles"
 ARTICLEMETA_PATH  = DATA_DIR / "articlemeta.json"
+GRADE_CACHE_PATH  = DATA_DIR / "grade_cache.json"
 
 # ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
+
+# ── Grade cache helpers ───────────────────────────────────────────────────────
+_grade_cache: dict = {}  # "owner/repo@branch" → {report, prompt, cached_at, repo_url}
+
+def _load_grade_cache():
+    global _grade_cache
+    _grade_cache = json.loads(GRADE_CACHE_PATH.read_text()) if GRADE_CACHE_PATH.exists() else {}
+
+def _save_grade_cache():
+    GRADE_CACHE_PATH.write_text(json.dumps(_grade_cache, ensure_ascii=False, indent=2))
+
+_load_grade_cache()
 
 # ── Article messages (feedback) ───────────────────────────────────────────────
 ARTICLE_MESSAGES_PATH = DATA_DIR / "article_messages.json"
@@ -1483,10 +1496,15 @@ function doGrade() {{
 
     // Auto-call AI grading
     log('<span style="color:#60a5fa">🤖 正在呼叫 AI 評分（claude-sonnet-4.6）...</span>');
+    _callAiGrade(false);
+  }});
+}}
+
+function _callAiGrade(force) {{
     fetch('/ai_grade', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ prompt: _prompt, meta: _meta }})
+      body: JSON.stringify({{ prompt: _prompt, meta: _meta, force: force }})
     }})
     .then(r => {{
       if (!r.ok) {{
@@ -1499,7 +1517,12 @@ function doGrade() {{
         _reportMd = result.report;
         document.getElementById('report-card').style.display = 'block';
         document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
-        log('<span style="color:#86efac">✅ AI 評分完成！</span>');
+        // Show cache status
+        const cacheInfo = result.from_cache
+          ? '<span style="color:#fbbf24">⚡ 使用快取結果（' + escHtml(result.cached_at || '') + '）</span>'
+            + ' <button class="btn" style="font-size:.75rem;padding:3px 10px;margin-left:8px" onclick="_regrade()">🔄 重新評分</button>'
+          : '<span style="color:#86efac">✅ AI 評分完成！</span>';
+        log(cacheInfo);
         // Show chat panel
         _chatHistory = [];
         document.getElementById('chat-card').style.display = 'block';
@@ -1544,6 +1567,14 @@ function stopGrade() {{
     document.getElementById('prompt-card').style.display = 'block';
     document.getElementById('prompt-box').textContent = _prompt;
   }}
+}}
+
+function _regrade() {{
+  if (!_prompt) {{ alert('請先跑評分流程取得 Prompt'); return; }}
+  log('<span style="color:#60a5fa">🔄 強制重新評分（忽略快取）...</span>');
+  document.getElementById('report-card').style.display = 'none';
+  document.getElementById('chat-card').style.display = 'none';
+  _callAiGrade(true);
 }}
 
 function copyPrompt() {{
@@ -1809,13 +1840,49 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
     """Grade using GitHub Copilot API (claude-sonnet-4.6 via GitHub Copilot)."""
-    prompt = payload.get("prompt", "")
+    import time as _time
+    prompt   = payload.get("prompt", "")
+    meta     = payload.get("meta", {})       # {owner, repo, branch, repo_url, ...}
+    force    = payload.get("force", False)   # True = 強制重跑，忽略快取
+
     if not prompt:
         raise HTTPException(400, "prompt required")
 
+    # Build cache key from meta (owner/repo@branch)
+    cache_key = None
+    if meta.get("owner") and meta.get("repo"):
+        branch = meta.get("branch", "main")
+        cache_key = f"{meta['owner']}/{meta['repo']}@{branch}"
+
+    # Return from cache if available and not forced
+    if cache_key and not force and cache_key in _grade_cache:
+        cached = _grade_cache[cache_key]
+        return {
+            "report":    cached["report"],
+            "auto":      True,
+            "from_cache": True,
+            "cached_at": cached["cached_at"],
+            "cache_key": cache_key,
+        }
+
     try:
         report = await _call_copilot_api(prompt)
-        return {"report": report, "auto": True}
+
+        # Save to cache on success
+        if cache_key:
+            _grade_cache[cache_key] = {
+                "report":    report,
+                "prompt":    prompt,
+                "cached_at": _time.strftime("%Y-%m-%dT%H:%M:%S+08:00",
+                                            _time.localtime(_time.time() + 28800)),
+                "repo_url":  meta.get("repo_url", ""),
+                "owner":     meta.get("owner", ""),
+                "repo":      meta.get("repo", ""),
+                "branch":    meta.get("branch", ""),
+            }
+            _save_grade_cache()
+
+        return {"report": report, "auto": True, "from_cache": False, "cache_key": cache_key}
     except Exception as e:
         # Fallback: return prompt for manual use
         return {
@@ -1823,6 +1890,34 @@ async def ai_grade(payload: dict):
             "auto": False,
             "message": f"AI 評分失敗（{e}），請複製 Prompt 到 Claude / ChatGPT"
         }
+
+
+@app.get("/grade_cache")
+def list_grade_cache(rag_token: Optional[str] = Cookie(None)):
+    """List all cached grading results."""
+    if rag_token not in _sessions:
+        raise HTTPException(401, "Not authenticated")
+    result = []
+    for key, val in _grade_cache.items():
+        result.append({
+            "cache_key":  key,
+            "repo_url":   val.get("repo_url", ""),
+            "cached_at":  val.get("cached_at", ""),
+            "report_len": len(val.get("report", "")),
+        })
+    return {"caches": result, "total": len(result)}
+
+
+@app.delete("/grade_cache/{cache_key:path}")
+def delete_grade_cache(cache_key: str, rag_token: Optional[str] = Cookie(None)):
+    """Delete a cached grading result (force re-grade on next run)."""
+    if rag_token not in _sessions:
+        raise HTTPException(401, "Not authenticated")
+    if cache_key not in _grade_cache:
+        raise HTTPException(404, f"Cache key not found: {cache_key}")
+    del _grade_cache[cache_key]
+    _save_grade_cache()
+    return {"deleted": cache_key}
 
 
 @app.post("/chat_with_report")
