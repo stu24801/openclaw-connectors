@@ -1786,6 +1786,21 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
             headers=headers,
             json=body,
         )
+        # 401 → token expired, wait for openclaw gateway to refresh (up to 15s), then retry
+        if resp.status_code == 401:
+            import asyncio as _asyncio
+            for _wait in (3, 5, 7):
+                await _asyncio.sleep(_wait)
+                new_token = _load_copilot_token()
+                if new_token and new_token != token:
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    token = new_token
+                    break
+            resp = await client.post(
+                "https://api.githubcopilot.com/chat/completions",
+                headers=headers,
+                json=body,
+            )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
