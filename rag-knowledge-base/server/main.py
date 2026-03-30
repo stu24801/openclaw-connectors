@@ -1498,6 +1498,25 @@ function doGrade() {{
     log('<span style="color:#60a5fa">🤖 正在呼叫 AI 評分（claude-sonnet-4.6）...</span>');
     _callAiGrade(false);
   }});
+
+  _sse.addEventListener('error', e => {{
+    _sse.close();
+    document.getElementById('stop-btn').style.display = 'none';
+    document.getElementById('grade-btn').disabled = false;
+    if (e.data) {{
+      log('<span style="color:#fca5a5">❌ ' + escHtml(e.data) + '</span>');
+      document.getElementById('error-area').innerHTML =
+        '<div class="alert alert-error">❌ ' + escHtml(e.data) + '</div>';
+    }}
+  }});
+
+  _sse.onerror = () => {{
+    if (_sse.readyState === EventSource.CLOSED) return;
+    _sse.close();
+    document.getElementById('stop-btn').style.display = 'none';
+    document.getElementById('grade-btn').disabled = false;
+    log('<span style="color:#fca5a5">⚠️ SSE 連線中斷</span>');
+  }};
 }}
 
 function _callAiGrade(force) {{
@@ -1535,26 +1554,6 @@ function _callAiGrade(force) {{
     .catch(e => {{
       log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
     }});
-  }});
-
-  _sse.addEventListener('error', e => {{
-    _sse.close();
-    document.getElementById('stop-btn').style.display = 'none';
-    document.getElementById('grade-btn').disabled = false;
-    if (e.data) {{
-      log('<span style="color:#fca5a5">❌ ' + escHtml(e.data) + '</span>');
-      document.getElementById('error-area').innerHTML =
-        '<div class="alert alert-error">❌ ' + escHtml(e.data) + '</div>';
-    }}
-  }});
-
-  _sse.onerror = () => {{
-    if (_sse.readyState === EventSource.CLOSED) return;
-    _sse.close();
-    document.getElementById('stop-btn').style.display = 'none';
-    document.getElementById('grade-btn').disabled = false;
-    log('<span style="color:#fca5a5">⚠️ SSE 連線中斷</span>');
-  }};
 }}
 
 function stopGrade() {{
