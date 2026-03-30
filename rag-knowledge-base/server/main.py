@@ -3309,6 +3309,43 @@ def _collect_system_status() -> dict:
         pass
     services.append({"name": "llm-proxy (port 9000)", "status": "active" if llm_proxy_ok else "inactive", "ok": llm_proxy_ok})
 
+    # city-game (PM2)
+    city_game_status = "unknown"
+    city_game_ok = False
+    try:
+        pm2_result = subprocess.run(
+            ["/home/millalex921/.npm-global/bin/pm2", "jlist"],
+            capture_output=True, text=True, timeout=5
+        )
+        if pm2_result.returncode == 0:
+            pm2_list = json.loads(pm2_result.stdout)
+            for proc in pm2_list:
+                if proc.get("name") == "city-game":
+                    pm2_status = proc.get("pm2_env", {}).get("status", "unknown")
+                    city_game_status = pm2_status
+                    city_game_ok = (pm2_status == "online")
+                    break
+            else:
+                city_game_status = "not found"
+    except Exception:
+        city_game_status = "error"
+
+    # HTTP health check
+    city_game_http = False
+    try:
+        req = urllib.request.Request("http://127.0.0.1:3003/", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            city_game_http = (resp.status == 200)
+    except Exception:
+        pass
+
+    services.append({
+        "name": "city-game (port 3003)",
+        "status": city_game_status if city_game_ok else ("stopped" if city_game_status != "error" else "error"),
+        "ok": city_game_ok and city_game_http,
+        "extra": f"HTTP {'✅' if city_game_http else '❌'} | PM2 {city_game_status}"
+    })
+
     # 9. WhatsApp session status
     wa_dir = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
     wa_status = {"exists": False, "hasCreds": False, "fileCount": 0}
@@ -3371,6 +3408,46 @@ def _collect_system_status() -> dict:
         "agentConfigs": agent_configs,
         "contextSettings": context_settings,
     }
+
+
+@app.post("/api/game_control")
+def api_game_control(action: str, rag_token: Optional[str] = Cookie(None)):
+    """控制 city-game PM2 進程 (start/stop/restart)"""
+    if not _auth(rag_token):
+        raise HTTPException(401, "Not authenticated")
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(400, f"Invalid action: {action}")
+    pm2 = "/home/millalex921/.npm-global/bin/pm2"
+    try:
+        result = subprocess.run(
+            [pm2, action, "city-game"],
+            capture_output=True, text=True, timeout=15
+        )
+        import time; time.sleep(2)
+        status_result = subprocess.run(
+            [pm2, "jlist"],
+            capture_output=True, text=True, timeout=10
+        )
+        current_status = "unknown"
+        if status_result.returncode == 0:
+            try:
+                pm2_list = json.loads(status_result.stdout)
+                for proc in pm2_list:
+                    if proc.get("name") == "city-game":
+                        current_status = proc.get("pm2_env", {}).get("status", "unknown")
+            except Exception:
+                pass
+        return {
+            "ok": result.returncode == 0,
+            "action": action,
+            "status": current_status,
+            "stdout": result.stdout[-500:] if result.stdout else "",
+            "stderr": result.stderr[-200:] if result.stderr else ""
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "PM2 command timed out")
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/sys_status")
@@ -3520,11 +3597,17 @@ function renderStatus(data) {
   // ── 服務狀態 ─────────────────────────────────────────────────────────────
   const svcRows = (data.services || []).map(s => {
     const badge = s.ok ? '<span class="badge-ok">● active</span>' : `<span class="badge-err">● ${escHtml(s.status)}</span>`;
+    const isGame = s.name && s.name.includes('city-game');
+    const controlBtns = isGame ? `
+      <span style="display:inline-flex;gap:6px;margin-left:8px">
+        <button onclick="gameControl('start')" style="background:#052e16;color:#86efac;border:1px solid #166534;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">▶ 啟動</button>
+        <button onclick="gameControl('stop')" style="background:#450a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">⏹ 停止</button>
+      </span>` : '';
     return `<div class="stat-row">
       <span class="stat-label" style="display:flex;align-items:center;gap:7px">
         <span class="dot ${s.ok ? 'dot-green' : 'dot-red'}"></span>${escHtml(s.name)}
       </span>
-      ${badge}
+      <span style="display:flex;align-items:center;gap:4px">${badge}${controlBtns}</span>
     </div>`;
   }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無服務資訊</span></div>';
 
@@ -3826,6 +3909,25 @@ function renderStatus(data) {
   `;
 
   document.getElementById('last-updated').textContent = '最後更新：' + data.collectedAt + ' (Asia/Taipei)';
+}
+
+async function gameControl(action) {
+  const label = action === 'start' ? '啟動' : action === 'stop' ? '停止' : '重啟';
+  try {
+    const r = await fetch(`/api/game_control?action=${action}`, {
+      method: 'POST',
+      credentials: 'include'
+    });
+    const data = await r.json();
+    if (data.ok) {
+      alert(`✅ city-game ${label}成功！目前狀態：${data.status}`);
+    } else {
+      alert(`❌ ${label}失敗：${data.stderr || data.stdout || '未知錯誤'}`);
+    }
+    refreshStatus();
+  } catch(e) {
+    alert(`❌ 請求失敗：${e.message}`);
+  }
 }
 
 async function refreshStatus() {
