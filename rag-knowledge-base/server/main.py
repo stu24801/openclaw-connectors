@@ -2912,6 +2912,7 @@ def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[s
         {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
+        <button onclick="shareArticle('{article_id}')" class="btn btn-sm btn-ghost">🔗 分享</button>
         <a href="/articles/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ 下載 .md</a>
         <a href="/articles" class="btn btn-sm btn-ghost" style="text-decoration:none">← 回列表</a>
       </div>
@@ -3144,6 +3145,26 @@ async function sendFeedback(){{
 
 loadMessages();
 setInterval(loadMessages,5000);
+</script>
+"""
+    body += """
+<script>
+async function shareArticle(id) {
+    const pwd = prompt("設定分享密碼 (留空則不加密):");
+    if (pwd === null) return;
+    const res = await fetch(`/articles/${id}/share`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({password: pwd})
+    });
+    const data = await res.json();
+    if (data.url) {
+        const fullUrl = window.location.origin + data.url;
+        prompt("分享網址已產生！", fullUrl);
+    } else {
+        alert("分享失敗");
+    }
+}
 </script>
 """
     return HTMLResponse(_base_html(body, f"{am['title']} — 文章庫"))
