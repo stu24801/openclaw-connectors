@@ -2744,6 +2744,19 @@ def share_view_get(article_id: str, request: Request, v: Optional[str] = None):
     '''
     return HTMLResponse(_share_html(body, am['title']))
 
+@app.get("/share/{article_id}/download")
+def share_download(article_id: str, request: Request):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am or not am.get("share_enabled"):
+        raise HTTPException(404, "Article not found or not shared")
+    auth_cookie = request.cookies.get(f"share_auth_{article_id}")
+    if am.get("share_pwd") and auth_cookie != am.get("share_pwd"):
+        raise HTTPException(401, "Unauthorized")
+    path = Path(am["path"])
+    if not path.exists():
+        raise HTTPException(404, "File missing")
+    return FileResponse(str(path), filename=am["filename"], media_type="text/markdown")
+
 @app.post("/share/{article_id}", response_class=HTMLResponse)
 def share_view_post(article_id: str, pwd: str = Form(...)):
     am = next((a for a in _articlemeta if a["id"] == article_id), None)
