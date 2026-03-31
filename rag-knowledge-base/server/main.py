@@ -352,13 +352,82 @@ def _share_html(body: str, title: str) -> str:
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
-  .btn{{display:inline-block;padding:8px 16px;border-radius:6px;font-size:0.9rem;cursor:pointer;text-align:center;border:none;color:#fff;text-decoration:none;transition:background .2s}}
-  .btn-primary{{background:#4f46e5;color:#fff}}
-  .btn-primary:hover{{background:#4338ca}}
+  .container{{max-width:1100px;margin:32px auto;padding:0 16px}}
+  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:24px;margin-bottom:24px}}
+  .card h2{{font-size:1rem;font-weight:600;color:#a78bfa;margin-bottom:18px;display:flex;align-items:center;gap:8px}}
+  label{{font-size:.9rem;color:#94a3b8;display:block;margin-bottom:6px}}
+  input[type=text],input[type=password],input[type=file],select,textarea{{
+    width:100%;padding:12px 14px;background:#0f1117;border:1px solid #2d3154;
+    border-radius:8px;color:#e2e8f0;font-size:16px;outline:none;transition:.2s
+  }}
+  select option{{background:#1a1d2e}}
+  input:focus,select:focus,textarea:focus{{border-color:#a78bfa}}
+  .btn{{display:inline-flex;align-items:center;justify-content:center;padding:12px 22px;background:#7c3aed;color:#fff;
+    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s;min-height:44px;min-width:44px}}
+  .btn:hover{{background:#6d28d9}}
+  .btn-sm{{padding:8px 14px;font-size:.82rem;border-radius:6px;min-height:44px}}
+  .btn-danger{{background:#dc2626}}.btn-danger:hover{{background:#b91c1c}}
+  .btn-ghost{{background:transparent;border:1px solid #374151;color:#94a3b8}}
+  .btn-ghost:hover{{background:#1f2937;color:#e2e8f0}}
+  .alert{{padding:12px 16px;border-radius:8px;font-size:.85rem;margin-bottom:16px}}
+  .alert-error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5}}
+  .alert-success{{background:#052e16;border:1px solid #14532d;color:#86efac}}
+  .table-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  table{{width:100%;border-collapse:collapse;font-size:.85rem;min-width:480px}}
+  th{{text-align:left;padding:10px 12px;background:#0f1117;color:#64748b;font-weight:500;border-bottom:1px solid #2d3154}}
+  td{{padding:10px 12px;border-bottom:1px solid #1e2235;vertical-align:middle}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#1e2235}}
+  .badge{{display:inline-block;padding:3px 8px;border-radius:99px;font-size:.75rem;font-weight:500}}
+  .badge-purple{{background:#3b0764;color:#c4b5fd}}
+  .badge-blue{{background:#1e3a5f;color:#93c5fd}}
+  .badge-green{{background:#052e16;color:#86efac}}
+  .empty{{color:#4b5563;text-align:center;padding:32px;font-size:.9rem}}
+  .form-row{{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}}
+  .form-row>*{{flex:1;min-width:140px}}
+  .form-row .btn{{flex:0 0 auto}}
+  .stat{{display:inline-flex;align-items:center;gap:6px;background:#0f1117;
+    border:1px solid #2d3154;border-radius:8px;padding:8px 16px;font-size:.85rem}}
+  .stat-val{{font-size:1.2rem;font-weight:700;color:#a78bfa}}
+  .article-card{{display:none}}
+  @media(max-width:768px){{
+    .desktop-only{{display:none}}
+    .article-card{{display:block;background:#1a1d2e;border:1px solid #2d3154;border-radius:10px;padding:16px;margin-bottom:12px}}
+    .article-card-title{{color:#a78bfa;font-size:.95rem;font-weight:600;margin-bottom:8px;text-decoration:none;display:block}}
+    .article-card-meta{{color:#64748b;font-size:.8rem;margin-bottom:12px}}
+    .article-card-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+    .layout-flex{{flex-direction:column;padding:0}}
+    .sidebar-panel{{display:none;width:100%;margin-bottom:24px;border-right:none;padding-right:0}}
+    .sidebar-panel.active{{display:block}}
+    .content-wrap{{width:100%;padding:0 16px}}
+    #art-wrap{{padding:16px 16px 40px 16px!important}}
+    #chat-panel{{position:static!important;width:100%!important;height:400px!important;border-left:none!important;border-top:1px solid #2d3154;margin-top:24px}}
+    #toc-panel{{display:none}}
+    .container{{padding:0}}
+  }}
+  @media(min-width:769px){{
+    .layout-flex{{display:flex;gap:24px}}
+    .sidebar-panel{{width:220px;flex-shrink:0}}
+    .content-wrap{{flex:1;min-width:0}}
+  }}
+  #rendered{{line-height:1.8;color:#cbd5e1;font-size:.95rem;word-break:break-word;overflow-wrap:break-word;padding:12px 0;}}
+  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em;word-break:break-word}}
+  #rendered p{{margin-bottom:.9em}}
+  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac;word-break:break-all}}
+  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em;max-width:100%}}
+  #rendered pre code{{background:none;padding:0;word-break:normal}}
+  #rendered blockquote{{border-left:3px solid #a78bfa;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
+  #rendered a{{color:#60a5fa;word-break:break-all}}
+  #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
+  #rendered img{{max-width:100%;height:auto;border-radius:8px;display:block}}
+  #rendered hr{{border:none;border-top:1px solid #2d3154;margin:1.5em 0}}
+  #rendered table{{width:100%;border-collapse:collapse;font-size:.85rem;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  #rendered th{{text-align:left;padding:8px 10px;background:#0f1117;color:#64748b;border-bottom:1px solid #2d3154}}
+  #rendered td{{padding:8px 10px;border-bottom:1px solid #1e2235;vertical-align:top}}
 </style>
 </head>
 <body>
-<div style="padding: 24px; max-width: 800px; margin: 0 auto;">
+<div class="container">
 {body}
 </div>
 </body>
@@ -2519,7 +2588,7 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   <td style="color:#64748b;font-size:.8rem">{a.get('uploaded_at','')}</td>
   <td style="color:#64748b;font-size:.8rem">{size_kb} KB</td>
   <td style="white-space:nowrap">
-    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
+    <button onclick="shareArticle('{a['id']}')" class="btn btn-sm btn-ghost">🔗 分享</button> <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
     &nbsp;
     <form method="post" action="/articles/{a['id']}/delete" style="display:inline"
           onsubmit="return confirm('確定刪除？')">
@@ -2532,7 +2601,7 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   <a href="/articles/{a['id']}" class="article-card-title">{a['title']}</a>
   <div class="article-card-meta">✍️ {a.get('author','—')} &nbsp;·&nbsp; {a.get('uploaded_at','')} &nbsp;·&nbsp; {size_kb} KB</div>
   <div class="article-card-actions">
-    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
+    <button onclick="shareArticle('{a['id']}')" class="btn btn-sm btn-ghost">🔗 分享</button> <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
     <form method="post" action="/articles/{a['id']}/delete"
           onsubmit="return confirm('確定刪除？')">
       <button class="btn btn-sm btn-danger">🗑 刪除</button>
@@ -2578,9 +2647,99 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   {table}
 </div>
 """
+    body += """
+<script>
+async function shareArticle(id) {
+    const pwd = prompt("設定分享密碼 (留空則不加密):");
+    if (pwd === null) return;
+    const res = await fetch(`/articles/${id}/share`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({password: pwd})
+    });
+    const data = await res.json();
+    if (data.url) {
+        const fullUrl = window.location.origin + data.url;
+        prompt("分享網址已產生！", fullUrl);
+    } else {
+        alert("分享失敗");
+    }
+}
+</script>
+"""
     return HTMLResponse(_base_html(body, "文章庫 — RAG KB"))
 
 @app.get("/articles/{article_id}", response_class=HTMLResponse)
+
+# ── 分享功能 ───────────────────────────────────────────────────────────────
+@app.post("/articles/{article_id}/share")
+async def share_article_api(article_id: str, request: Request, rag_token: Optional[str] = Cookie(None)):
+    if not _auth(rag_token):
+        raise HTTPException(401, "Unauthorized")
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404, "Article not found")
+    try:
+        body = await request.json()
+        pwd = body.get("password", "").strip()
+    except:
+        pwd = ""
+    
+    am["share_pwd"] = pwd
+    am["share_enabled"] = True
+    _save_articlemeta()
+    return JSONResponse({"status": "ok", "url": f"/share/{article_id}"})
+
+@app.get("/share/{article_id}", response_class=HTMLResponse)
+def share_view_get(article_id: str, request: Request, v: Optional[str] = None):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am or not am.get("share_enabled"):
+        return HTMLResponse(_share_html("<div style='text-align:center;padding:50px;'>此文章未開放分享。</div>", "文章未分享"))
+    
+    auth_cookie = request.cookies.get(f"share_auth_{article_id}")
+    if am.get("share_pwd") and auth_cookie != am.get("share_pwd"):
+        body = f'''
+        <div style="max-width:400px;margin:100px auto;padding:32px;background:#1a1d2e;border-radius:12px;border:1px solid #2d3154;text-align:center;">
+          <h2 style="color:#e2e8f0;margin-top:0">🔒 密碼保護文章</h2>
+          <p style="color:#94a3b8;margin-bottom:24px;">請輸入密碼以閱讀 《{am['title']}》</p>
+          <form method="POST" action="/share/{article_id}">
+            <input type="password" name="pwd" placeholder="請輸入密碼" required style="width:100%;padding:12px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;margin-bottom:20px;box-sizing:border-box;">
+            <button type="submit" class="btn btn-primary" style="width:100%;">解鎖文章</button>
+          </form>
+        </div>
+        '''
+        return HTMLResponse(_share_html(body, "解鎖文章"))
+
+    path = Path(am["path"])
+    content_text = path.read_text(encoding="utf-8") if path.exists() else "（檔案遺失）"
+    content_escaped = json.dumps(content_text)
+    
+    body = f'''
+    <div style="margin-bottom:24px;border-bottom:1px solid #2d3154;padding-bottom:16px;">
+        <h1 style="color:#e2e8f0;margin:0 0 8px 0;">{am['title']}</h1>
+        <div style="color:#94a3b8;font-size:0.9rem;">作者: {am.get('author','—')} | 時間: {am.get('uploaded_at','')}</div>
+    </div>
+    <div id="rendered"></div>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        document.getElementById('rendered').innerHTML = marked.parse({content_escaped});
+    </script>
+    '''
+    return HTMLResponse(_share_html(body, am['title']))
+
+@app.post("/share/{article_id}", response_class=HTMLResponse)
+def share_view_post(article_id: str, pwd: str = Form(...)):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am or not am.get("share_enabled"):
+        return HTMLResponse(_share_html("文章未分享", "Error"))
+    
+    if pwd != am.get("share_pwd"):
+        return HTMLResponse(_share_html("<div style='text-align:center;padding:50px;'>密碼錯誤。<br><a href='/share/"+article_id+"' class='btn btn-primary'>重試</a></div>", "密碼錯誤"))
+    
+    resp = RedirectResponse(f"/share/{article_id}", status_code=303)
+    resp.set_cookie(key=f"share_auth_{article_id}", value=pwd, max_age=86400*30)
+    return resp
+
 def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")

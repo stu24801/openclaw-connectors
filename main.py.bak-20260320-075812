@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 
 # ── OpenClaw Gateway ─────────────────────────────────────────────────────────
 OPENCLAW_GATEWAY_URL   = os.getenv("OPENCLAW_GATEWAY_URL",   "http://127.0.0.1:8080")
-OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "3056ad885dd941a5795fb4ac8dcd10b677ac4d2c5d4f696f")
 WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:main:main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -31,28 +31,15 @@ VEC0_SO       = os.path.expanduser(os.getenv("VEC0_SO",
 EMBED_URL     = os.getenv("EMBED_URL", "http://127.0.0.1:8766/embed")
 QMD_COLL      = "rag-kb"
 TOP_K         = int(os.getenv("RAG_TOP_K", "5"))
-PASSWORD        = os.getenv("RAG_PASSWORD", "")
-WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "")
+PASSWORD        = os.getenv("RAG_PASSWORD", "changeme")
+WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "writer123")
 
 # ── Articles (writer uploads) ─────────────────────────────────────────────────
 ARTICLES_DIR      = DATA_DIR / "articles"
 ARTICLEMETA_PATH  = DATA_DIR / "articlemeta.json"
-GRADE_CACHE_PATH  = DATA_DIR / "grade_cache.json"
 
 # ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
-
-# ── Grade cache helpers ───────────────────────────────────────────────────────
-_grade_cache: dict = {}  # "owner/repo@branch" → {report, prompt, cached_at, repo_url}
-
-def _load_grade_cache():
-    global _grade_cache
-    _grade_cache = json.loads(GRADE_CACHE_PATH.read_text()) if GRADE_CACHE_PATH.exists() else {}
-
-def _save_grade_cache():
-    GRADE_CACHE_PATH.write_text(json.dumps(_grade_cache, ensure_ascii=False, indent=2))
-
-_load_grade_cache()
 
 # ── Article messages (feedback) ───────────────────────────────────────────────
 ARTICLE_MESSAGES_PATH = DATA_DIR / "article_messages.json"
@@ -224,33 +211,11 @@ def _ask_writer_agent(article_id: str, owner_message: str):
         f"「{owner_message}」\n\n"
         f"📄 文章 ID：{article_id}\n"
         f"🔗 對話介面：https://rag.alex-stu24801.com/articles/{article_id}\n\n"
-        f"請依照以下步驟處理：\n\n"
-        f"【步驟 1】先下載原文（必做，不可跳過）\n"
-        f"curl -s -H 'X-Writer-Token: writer123' \\\n"
-        f"  https://rag.alex-stu24801.com/articles/{article_id}/download \\\n"
-        f"  -o /tmp/article_{article_id[:8]}.md\n\n"
-        f"【步驟 2】在對話視窗回覆景揚（讓他知道你已收到）\n"
-        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages \\\n"
-        f"  -H 'Content-Type: application/json' \\\n"
-        f"  -H 'X-Writer-Token: writer123' \\\n"
-        f"  -d '{{\"content\": \"收到！正在處理，請稍候。\"}}'\n\n"
-        f"【步驟 3】局部修改文章（🔴 嚴格守則）\n"
-        f"- 只修改景揚明確要求的段落，其餘所有內容必須與原文完全一致\n"
-        f"- 禁止「順手」改寫未被要求的段落、標題或措辭\n"
-        f"- 修改完成後，用 diff 確認變動範圍符合要求：\n"
-        f"  diff /tmp/article_{article_id[:8]}.md /tmp/revised_{article_id[:8]}.md\n"
-        f"- 若 diff 顯示超出要求範圍的變動，立刻撤銷多餘修改\n\n"
-        f"【步驟 4】提交修改版（必須用 multipart/form-data，不是 JSON）\n"
-        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/revise \\\n"
-        f"  -H 'X-Writer-Token: writer123' \\\n"
-        f"  -F 'file=@/tmp/revised_{article_id[:8]}.md;type=text/markdown' \\\n"
-        f"  -F 'note=修改說明（簡述改了哪個段落）'\n\n"
-        f"【步驟 5】在對話視窗告知景揚已完成\n"
-        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages \\\n"
-        f"  -H 'Content-Type: application/json' \\\n"
-        f"  -H 'X-Writer-Token: writer123' \\\n"
-        f"  -d '{{\"content\": \"已完成修改，只調整了 [段落名稱]，其餘內容維持原樣。\"}}'\n\n"
-        f"⚠️ 對話視窗的 content 只能是簡短說明，絕對不要貼出文章片段或全文。"
+        f"請你立即回覆景揚。步驟：\n"
+        f"1. 透過 POST https://rag.alex-stu24801.com/articles/{article_id}/messages 回覆\n"
+        f"   （X-Writer-Token header，使用自然對話口吻，簡短即可）\n"
+        f"2. 若需要修改文章內容，再透過 POST https://rag.alex-stu24801.com/articles/{article_id}/revise 提交修改版\n"
+        f"⚠️ 回覆訊息時，『絕對不要』貼出整篇文章或任何文章片段，只需用簡短自然的對話告訴景揚你的想法或已完成的修改。"
     )
 
     payload = {
@@ -341,97 +306,6 @@ def startup():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML helpers
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _share_html(body: str, title: str) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
-  .container{{max-width:1100px;margin:32px auto;padding:0 16px}}
-  .card{{background:#1a1d2e;border:1px solid #2d3154;border-radius:12px;padding:24px;margin-bottom:24px}}
-  .card h2{{font-size:1rem;font-weight:600;color:#a78bfa;margin-bottom:18px;display:flex;align-items:center;gap:8px}}
-  label{{font-size:.9rem;color:#94a3b8;display:block;margin-bottom:6px}}
-  input[type=text],input[type=password],input[type=file],select,textarea{{
-    width:100%;padding:12px 14px;background:#0f1117;border:1px solid #2d3154;
-    border-radius:8px;color:#e2e8f0;font-size:16px;outline:none;transition:.2s
-  }}
-  select option{{background:#1a1d2e}}
-  input:focus,select:focus,textarea:focus{{border-color:#a78bfa}}
-  .btn{{display:inline-flex;align-items:center;justify-content:center;padding:12px 22px;background:#7c3aed;color:#fff;
-    border:none;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:500;transition:.2s;min-height:44px;min-width:44px}}
-  .btn:hover{{background:#6d28d9}}
-  .btn-sm{{padding:8px 14px;font-size:.82rem;border-radius:6px;min-height:44px}}
-  .btn-danger{{background:#dc2626}}.btn-danger:hover{{background:#b91c1c}}
-  .btn-ghost{{background:transparent;border:1px solid #374151;color:#94a3b8}}
-  .btn-ghost:hover{{background:#1f2937;color:#e2e8f0}}
-  .alert{{padding:12px 16px;border-radius:8px;font-size:.85rem;margin-bottom:16px}}
-  .alert-error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5}}
-  .alert-success{{background:#052e16;border:1px solid #14532d;color:#86efac}}
-  .table-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch}}
-  table{{width:100%;border-collapse:collapse;font-size:.85rem;min-width:480px}}
-  th{{text-align:left;padding:10px 12px;background:#0f1117;color:#64748b;font-weight:500;border-bottom:1px solid #2d3154}}
-  td{{padding:10px 12px;border-bottom:1px solid #1e2235;vertical-align:middle}}
-  tr:last-child td{{border-bottom:none}}
-  tr:hover td{{background:#1e2235}}
-  .badge{{display:inline-block;padding:3px 8px;border-radius:99px;font-size:.75rem;font-weight:500}}
-  .badge-purple{{background:#3b0764;color:#c4b5fd}}
-  .badge-blue{{background:#1e3a5f;color:#93c5fd}}
-  .badge-green{{background:#052e16;color:#86efac}}
-  .empty{{color:#4b5563;text-align:center;padding:32px;font-size:.9rem}}
-  .form-row{{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}}
-  .form-row>*{{flex:1;min-width:140px}}
-  .form-row .btn{{flex:0 0 auto}}
-  .stat{{display:inline-flex;align-items:center;gap:6px;background:#0f1117;
-    border:1px solid #2d3154;border-radius:8px;padding:8px 16px;font-size:.85rem}}
-  .stat-val{{font-size:1.2rem;font-weight:700;color:#a78bfa}}
-  .article-card{{display:none}}
-  @media(max-width:768px){{
-    .desktop-only{{display:none}}
-    .article-card{{display:block;background:#1a1d2e;border:1px solid #2d3154;border-radius:10px;padding:16px;margin-bottom:12px}}
-    .article-card-title{{color:#a78bfa;font-size:.95rem;font-weight:600;margin-bottom:8px;text-decoration:none;display:block}}
-    .article-card-meta{{color:#64748b;font-size:.8rem;margin-bottom:12px}}
-    .article-card-actions{{display:flex;gap:8px;flex-wrap:wrap}}
-    .layout-flex{{flex-direction:column;padding:0}}
-    .sidebar-panel{{display:none;width:100%;margin-bottom:24px;border-right:none;padding-right:0}}
-    .sidebar-panel.active{{display:block}}
-    .content-wrap{{width:100%;padding:0 16px}}
-    #art-wrap{{padding:16px 16px 40px 16px!important}}
-    #chat-panel{{position:static!important;width:100%!important;height:400px!important;border-left:none!important;border-top:1px solid #2d3154;margin-top:24px}}
-    #toc-panel{{display:none}}
-    .container{{padding:0}}
-  }}
-  @media(min-width:769px){{
-    .layout-flex{{display:flex;gap:24px}}
-    .sidebar-panel{{width:220px;flex-shrink:0}}
-    .content-wrap{{flex:1;min-width:0}}
-  }}
-  #rendered{{line-height:1.8;color:#cbd5e1;font-size:.95rem;word-break:break-word;overflow-wrap:break-word;padding:12px 0;}}
-  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em;word-break:break-word}}
-  #rendered p{{margin-bottom:.9em}}
-  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac;word-break:break-all}}
-  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em;max-width:100%}}
-  #rendered pre code{{background:none;padding:0;word-break:normal}}
-  #rendered blockquote{{border-left:3px solid #a78bfa;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
-  #rendered a{{color:#60a5fa;word-break:break-all}}
-  #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
-  #rendered img{{max-width:100%;height:auto;border-radius:8px;display:block}}
-  #rendered hr{{border:none;border-top:1px solid #2d3154;margin:1.5em 0}}
-  #rendered table{{width:100%;border-collapse:collapse;font-size:.85rem;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}}
-  #rendered th{{text-align:left;padding:8px 10px;background:#0f1117;color:#64748b;border-bottom:1px solid #2d3154}}
-  #rendered td{{padding:8px 10px;border-bottom:1px solid #1e2235;vertical-align:top}}
-</style>
-</head>
-<body>
-<div class="container">
-{body}
-</div>
-</body>
-</html>"""
 
 def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = None) -> str:
     # Build sidebar category links
@@ -1587,7 +1461,35 @@ function doGrade() {{
 
     // Auto-call AI grading
     log('<span style="color:#60a5fa">🤖 正在呼叫 AI 評分（claude-sonnet-4.6）...</span>');
-    _callAiGrade(false);
+    fetch('/ai_grade', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ prompt: _prompt, meta: _meta }})
+    }})
+    .then(r => {{
+      if (!r.ok) {{
+        return r.text().then(t => {{ throw new Error(`HTTP ${{r.status}}: ${{t.substring(0, 100)}}`); }});
+      }}
+      return r.json();
+    }})
+    .then(result => {{
+      if (result.auto) {{
+        _reportMd = result.report;
+        document.getElementById('report-card').style.display = 'block';
+        document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
+        log('<span style="color:#86efac">✅ AI 評分完成！</span>');
+        // Show chat panel
+        _chatHistory = [];
+        document.getElementById('chat-card').style.display = 'block';
+        document.getElementById('chat-messages').innerHTML = '';
+        appendChatMsg('assistant', '評分完成！您可以在這裡詢問任何關於評分結果的問題，例如：「第 3 題為何扣分？」、「如何改善這份作業？」、「幫我寫一份改進建議給同學」');
+      }} else {{
+        log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
+      }}
+    }})
+    .catch(e => {{
+      log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
+    }});
   }});
 
   _sse.addEventListener('error', e => {{
@@ -1610,43 +1512,6 @@ function doGrade() {{
   }};
 }}
 
-function _callAiGrade(force) {{
-    fetch('/ai_grade', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ prompt: _prompt, meta: _meta, force: force }})
-    }})
-    .then(r => {{
-      if (!r.ok) {{
-        return r.text().then(t => {{ throw new Error(`HTTP ${{r.status}}: ${{t.substring(0, 100)}}`); }});
-      }}
-      return r.json();
-    }})
-    .then(result => {{
-      if (result.auto) {{
-        _reportMd = result.report;
-        document.getElementById('report-card').style.display = 'block';
-        document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
-        // Show cache status
-        const cacheInfo = result.from_cache
-          ? '<span style="color:#fbbf24">⚡ 使用快取結果（' + escHtml(result.cached_at || '') + '）</span>'
-            + ' <button class="btn" style="font-size:.75rem;padding:3px 10px;margin-left:8px" onclick="_regrade()">🔄 重新評分</button>'
-          : '<span style="color:#86efac">✅ AI 評分完成！</span>';
-        log(cacheInfo);
-        // Show chat panel
-        _chatHistory = [];
-        document.getElementById('chat-card').style.display = 'block';
-        document.getElementById('chat-messages').innerHTML = '';
-        appendChatMsg('assistant', '評分完成！您可以在這裡詢問任何關於評分結果的問題，例如：「第 3 題為何扣分？」、「如何改善這份作業？」、「幫我寫一份改進建議給同學」');
-      }} else {{
-        log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
-      }}
-    }})
-    .catch(e => {{
-      log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
-    }});
-}}
-
 function stopGrade() {{
   if (_sse) {{ _sse.close(); _sse = null; }}
   document.getElementById('stop-btn').style.display = 'none';
@@ -1657,14 +1522,6 @@ function stopGrade() {{
     document.getElementById('prompt-card').style.display = 'block';
     document.getElementById('prompt-box').textContent = _prompt;
   }}
-}}
-
-function _regrade() {{
-  if (!_prompt) {{ alert('請先跑評分流程取得 Prompt'); return; }}
-  log('<span style="color:#60a5fa">🔄 強制重新評分（忽略快取）...</span>');
-  document.getElementById('report-card').style.display = 'none';
-  document.getElementById('chat-card').style.display = 'none';
-  _callAiGrade(true);
 }}
 
 function copyPrompt() {{
@@ -1907,21 +1764,6 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
             headers=headers,
             json=body,
         )
-        # 401 → token expired, wait for openclaw gateway to refresh (up to 15s), then retry
-        if resp.status_code == 401:
-            import asyncio as _asyncio
-            for _wait in (3, 5, 7):
-                await _asyncio.sleep(_wait)
-                new_token = _load_copilot_token()
-                if new_token and new_token != token:
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    token = new_token
-                    break
-            resp = await client.post(
-                "https://api.githubcopilot.com/chat/completions",
-                headers=headers,
-                json=body,
-            )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -1930,49 +1772,13 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
     """Grade using GitHub Copilot API (claude-sonnet-4.6 via GitHub Copilot)."""
-    import time as _time
-    prompt   = payload.get("prompt", "")
-    meta     = payload.get("meta", {})       # {owner, repo, branch, repo_url, ...}
-    force    = payload.get("force", False)   # True = 強制重跑，忽略快取
-
+    prompt = payload.get("prompt", "")
     if not prompt:
         raise HTTPException(400, "prompt required")
 
-    # Build cache key from meta (owner/repo@branch)
-    cache_key = None
-    if meta.get("owner") and meta.get("repo"):
-        branch = meta.get("branch", "main")
-        cache_key = f"{meta['owner']}/{meta['repo']}@{branch}"
-
-    # Return from cache if available and not forced
-    if cache_key and not force and cache_key in _grade_cache:
-        cached = _grade_cache[cache_key]
-        return {
-            "report":    cached["report"],
-            "auto":      True,
-            "from_cache": True,
-            "cached_at": cached["cached_at"],
-            "cache_key": cache_key,
-        }
-
     try:
         report = await _call_copilot_api(prompt)
-
-        # Save to cache on success
-        if cache_key:
-            _grade_cache[cache_key] = {
-                "report":    report,
-                "prompt":    prompt,
-                "cached_at": _time.strftime("%Y-%m-%dT%H:%M:%S+08:00",
-                                            _time.localtime(_time.time() + 28800)),
-                "repo_url":  meta.get("repo_url", ""),
-                "owner":     meta.get("owner", ""),
-                "repo":      meta.get("repo", ""),
-                "branch":    meta.get("branch", ""),
-            }
-            _save_grade_cache()
-
-        return {"report": report, "auto": True, "from_cache": False, "cache_key": cache_key}
+        return {"report": report, "auto": True}
     except Exception as e:
         # Fallback: return prompt for manual use
         return {
@@ -1980,34 +1786,6 @@ async def ai_grade(payload: dict):
             "auto": False,
             "message": f"AI 評分失敗（{e}），請複製 Prompt 到 Claude / ChatGPT"
         }
-
-
-@app.get("/grade_cache")
-def list_grade_cache(rag_token: Optional[str] = Cookie(None)):
-    """List all cached grading results."""
-    if rag_token not in _sessions:
-        raise HTTPException(401, "Not authenticated")
-    result = []
-    for key, val in _grade_cache.items():
-        result.append({
-            "cache_key":  key,
-            "repo_url":   val.get("repo_url", ""),
-            "cached_at":  val.get("cached_at", ""),
-            "report_len": len(val.get("report", "")),
-        })
-    return {"caches": result, "total": len(result)}
-
-
-@app.delete("/grade_cache/{cache_key:path}")
-def delete_grade_cache(cache_key: str, rag_token: Optional[str] = Cookie(None)):
-    """Delete a cached grading result (force re-grade on next run)."""
-    if rag_token not in _sessions:
-        raise HTTPException(401, "Not authenticated")
-    if cache_key not in _grade_cache:
-        raise HTTPException(404, f"Cache key not found: {cache_key}")
-    del _grade_cache[cache_key]
-    _save_grade_cache()
-    return {"deleted": cache_key}
 
 
 @app.post("/chat_with_report")
@@ -2189,17 +1967,7 @@ async def writer_api_submit(request: Request):
     x_token = request.headers.get("X-Writer-Token", "")
     if not secrets.compare_digest(x_token, WRITER_PASSWORD):
         raise HTTPException(401, "Invalid writer token")
-    try:
-        payload = await request.json()
-    except Exception as e:
-        raise HTTPException(
-            400,
-            f"JSON parse error: {e}. "
-            "Hint: If submitting via curl shell, use a temp file to avoid shell escaping issues. "
-            "Example: echo '{\"title\":\"T\",\"author\":\"A\",\"content\":\"...\"}' > /tmp/p.json && "
-            "curl -X POST .../writer/api/submit -H 'Content-Type: application/json' "
-            "-H 'X-Writer-Token: writer123' --data-binary @/tmp/p.json"
-        )
+    payload = await request.json()
     title   = (payload.get("title") or "").strip()
     author  = (payload.get("author") or "").strip()
     content = (payload.get("content") or "").strip()
@@ -2588,7 +2356,7 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   <td style="color:#64748b;font-size:.8rem">{a.get('uploaded_at','')}</td>
   <td style="color:#64748b;font-size:.8rem">{size_kb} KB</td>
   <td style="white-space:nowrap">
-    <button onclick="shareArticle('{a['id']}')" class="btn btn-sm btn-ghost">🔗 分享</button> <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
+    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
     &nbsp;
     <form method="post" action="/articles/{a['id']}/delete" style="display:inline"
           onsubmit="return confirm('確定刪除？')">
@@ -2601,7 +2369,7 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   <a href="/articles/{a['id']}" class="article-card-title">{a['title']}</a>
   <div class="article-card-meta">✍️ {a.get('author','—')} &nbsp;·&nbsp; {a.get('uploaded_at','')} &nbsp;·&nbsp; {size_kb} KB</div>
   <div class="article-card-actions">
-    <button onclick="shareArticle('{a['id']}')" class="btn btn-sm btn-ghost">🔗 分享</button> <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
+    <a href="/articles/{a['id']}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ .md</a>
     <form method="post" action="/articles/{a['id']}/delete"
           onsubmit="return confirm('確定刪除？')">
       <button class="btn btn-sm btn-danger">🗑 刪除</button>
@@ -2647,99 +2415,9 @@ def articles_list(rag_token: Optional[str] = Cookie(None), msg: str = ""):
   {table}
 </div>
 """
-    body += """
-<script>
-async function shareArticle(id) {
-    const pwd = prompt("設定分享密碼 (留空則不加密):");
-    if (pwd === null) return;
-    const res = await fetch(`/articles/${id}/share`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({password: pwd})
-    });
-    const data = await res.json();
-    if (data.url) {
-        const fullUrl = window.location.origin + data.url;
-        prompt("分享網址已產生！", fullUrl);
-    } else {
-        alert("分享失敗");
-    }
-}
-</script>
-"""
     return HTMLResponse(_base_html(body, "文章庫 — RAG KB"))
 
 @app.get("/articles/{article_id}", response_class=HTMLResponse)
-
-# ── 分享功能 ───────────────────────────────────────────────────────────────
-@app.post("/articles/{article_id}/share")
-async def share_article_api(article_id: str, request: Request, rag_token: Optional[str] = Cookie(None)):
-    if not _auth(rag_token):
-        raise HTTPException(401, "Unauthorized")
-    am = next((a for a in _articlemeta if a["id"] == article_id), None)
-    if not am:
-        raise HTTPException(404, "Article not found")
-    try:
-        body = await request.json()
-        pwd = body.get("password", "").strip()
-    except:
-        pwd = ""
-    
-    am["share_pwd"] = pwd
-    am["share_enabled"] = True
-    _save_articlemeta()
-    return JSONResponse({"status": "ok", "url": f"/share/{article_id}"})
-
-@app.get("/share/{article_id}", response_class=HTMLResponse)
-def share_view_get(article_id: str, request: Request, v: Optional[str] = None):
-    am = next((a for a in _articlemeta if a["id"] == article_id), None)
-    if not am or not am.get("share_enabled"):
-        return HTMLResponse(_share_html("<div style='text-align:center;padding:50px;'>此文章未開放分享。</div>", "文章未分享"))
-    
-    auth_cookie = request.cookies.get(f"share_auth_{article_id}")
-    if am.get("share_pwd") and auth_cookie != am.get("share_pwd"):
-        body = f'''
-        <div style="max-width:400px;margin:100px auto;padding:32px;background:#1a1d2e;border-radius:12px;border:1px solid #2d3154;text-align:center;">
-          <h2 style="color:#e2e8f0;margin-top:0">🔒 密碼保護文章</h2>
-          <p style="color:#94a3b8;margin-bottom:24px;">請輸入密碼以閱讀 《{am['title']}》</p>
-          <form method="POST" action="/share/{article_id}">
-            <input type="password" name="pwd" placeholder="請輸入密碼" required style="width:100%;padding:12px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;margin-bottom:20px;box-sizing:border-box;">
-            <button type="submit" class="btn btn-primary" style="width:100%;">解鎖文章</button>
-          </form>
-        </div>
-        '''
-        return HTMLResponse(_share_html(body, "解鎖文章"))
-
-    path = Path(am["path"])
-    content_text = path.read_text(encoding="utf-8") if path.exists() else "（檔案遺失）"
-    content_escaped = json.dumps(content_text)
-    
-    body = f'''
-    <div style="margin-bottom:24px;border-bottom:1px solid #2d3154;padding-bottom:16px;">
-        <h1 style="color:#e2e8f0;margin:0 0 8px 0;">{am['title']}</h1>
-        <div style="color:#94a3b8;font-size:0.9rem;">作者: {am.get('author','—')} | 時間: {am.get('uploaded_at','')}</div>
-    </div>
-    <div id="rendered"></div>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script>
-        document.getElementById('rendered').innerHTML = marked.parse({content_escaped});
-    </script>
-    '''
-    return HTMLResponse(_share_html(body, am['title']))
-
-@app.post("/share/{article_id}", response_class=HTMLResponse)
-def share_view_post(article_id: str, pwd: str = Form(...)):
-    am = next((a for a in _articlemeta if a["id"] == article_id), None)
-    if not am or not am.get("share_enabled"):
-        return HTMLResponse(_share_html("文章未分享", "Error"))
-    
-    if pwd != am.get("share_pwd"):
-        return HTMLResponse(_share_html("<div style='text-align:center;padding:50px;'>密碼錯誤。<br><a href='/share/"+article_id+"' class='btn btn-primary'>重試</a></div>", "密碼錯誤"))
-    
-    resp = RedirectResponse(f"/share/{article_id}", status_code=303)
-    resp.set_cookie(key=f"share_auth_{article_id}", value=pwd, max_age=86400*30)
-    return resp
-
 def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
@@ -3489,43 +3167,6 @@ def _collect_system_status() -> dict:
         pass
     services.append({"name": "llm-proxy (port 9000)", "status": "active" if llm_proxy_ok else "inactive", "ok": llm_proxy_ok})
 
-    # city-game (PM2)
-    city_game_status = "unknown"
-    city_game_ok = False
-    try:
-        pm2_result = subprocess.run(
-            ["/home/millalex921/.npm-global/bin/pm2", "jlist"],
-            capture_output=True, text=True, timeout=5
-        )
-        if pm2_result.returncode == 0:
-            pm2_list = json.loads(pm2_result.stdout)
-            for proc in pm2_list:
-                if proc.get("name") == "city-game":
-                    pm2_status = proc.get("pm2_env", {}).get("status", "unknown")
-                    city_game_status = pm2_status
-                    city_game_ok = (pm2_status == "online")
-                    break
-            else:
-                city_game_status = "not found"
-    except Exception:
-        city_game_status = "error"
-
-    # HTTP health check
-    city_game_http = False
-    try:
-        req = urllib.request.Request("http://127.0.0.1:3003/", method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            city_game_http = (resp.status == 200)
-    except Exception:
-        pass
-
-    services.append({
-        "name": "city-game (port 3003)",
-        "status": city_game_status if city_game_ok else ("stopped" if city_game_status != "error" else "error"),
-        "ok": city_game_ok and city_game_http,
-        "extra": f"HTTP {'✅' if city_game_http else '❌'} | PM2 {city_game_status}"
-    })
-
     # 9. WhatsApp session status
     wa_dir = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
     wa_status = {"exists": False, "hasCreds": False, "fileCount": 0}
@@ -3588,46 +3229,6 @@ def _collect_system_status() -> dict:
         "agentConfigs": agent_configs,
         "contextSettings": context_settings,
     }
-
-
-@app.post("/api/game_control")
-def api_game_control(action: str, rag_token: Optional[str] = Cookie(None)):
-    """控制 city-game PM2 進程 (start/stop/restart)"""
-    if not _auth(rag_token):
-        raise HTTPException(401, "Not authenticated")
-    if action not in ("start", "stop", "restart"):
-        raise HTTPException(400, f"Invalid action: {action}")
-    pm2 = "/home/millalex921/.npm-global/bin/pm2"
-    try:
-        result = subprocess.run(
-            [pm2, action, "city-game"],
-            capture_output=True, text=True, timeout=15
-        )
-        import time; time.sleep(2)
-        status_result = subprocess.run(
-            [pm2, "jlist"],
-            capture_output=True, text=True, timeout=10
-        )
-        current_status = "unknown"
-        if status_result.returncode == 0:
-            try:
-                pm2_list = json.loads(status_result.stdout)
-                for proc in pm2_list:
-                    if proc.get("name") == "city-game":
-                        current_status = proc.get("pm2_env", {}).get("status", "unknown")
-            except Exception:
-                pass
-        return {
-            "ok": result.returncode == 0,
-            "action": action,
-            "status": current_status,
-            "stdout": result.stdout[-500:] if result.stdout else "",
-            "stderr": result.stderr[-200:] if result.stderr else ""
-        }
-    except subprocess.TimeoutExpired:
-        raise HTTPException(500, "PM2 command timed out")
-    except Exception as e:
-        raise HTTPException(500, str(e))
 
 
 @app.get("/api/sys_status")
@@ -3777,17 +3378,11 @@ function renderStatus(data) {
   // ── 服務狀態 ─────────────────────────────────────────────────────────────
   const svcRows = (data.services || []).map(s => {
     const badge = s.ok ? '<span class="badge-ok">● active</span>' : `<span class="badge-err">● ${escHtml(s.status)}</span>`;
-    const isGame = s.name && s.name.includes('city-game');
-    const controlBtns = isGame ? `
-      <span style="display:inline-flex;gap:6px;margin-left:8px">
-        <button onclick="gameControl('start')" style="background:#052e16;color:#86efac;border:1px solid #166534;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">▶ 啟動</button>
-        <button onclick="gameControl('stop')" style="background:#450a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">⏹ 停止</button>
-      </span>` : '';
     return `<div class="stat-row">
       <span class="stat-label" style="display:flex;align-items:center;gap:7px">
         <span class="dot ${s.ok ? 'dot-green' : 'dot-red'}"></span>${escHtml(s.name)}
       </span>
-      <span style="display:flex;align-items:center;gap:4px">${badge}${controlBtns}</span>
+      ${badge}
     </div>`;
   }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無服務資訊</span></div>';
 
@@ -3844,70 +3439,36 @@ function renderStatus(data) {
   if (!sessionRows) sessionRows = '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無活躍 Session</div>';
 
   // ── 費用估算 ──────────────────────────────────────────────────────────────
-  function resolveProvider(model) {
-    const m = (model || '').toLowerCase();
-    if (m.startsWith('anthropic/') || m.includes('claude')) return 'anthropic';
-    if (m.startsWith('github-copilot/')) return 'github-copilot';
-    if (m.startsWith('google-vertex/') || m.startsWith('google/') || m.includes('gemini')) return 'google';
-    if (m.startsWith('openai/') || m.includes('gpt-')) return 'openai';
-    return 'other';
-  }
   function modelCost(model, tokens) {
     const m = (model || '').toLowerCase();
     let inPrice = 0, outPrice = 0, label = null;
-    // Anthropic
-    if (m.includes('claude-opus-4') || m.includes('claude-opus-4.6')) { inPrice = 15.0; outPrice = 75.0; }
-    else if (m.includes('claude-sonnet-4') || m.includes('claude-sonnet-4.6') || m.includes('claude-sonnet-4-6')) { inPrice = 3.0; outPrice = 15.0; }
-    else if (m.includes('sonnet')) { inPrice = 3.0; outPrice = 15.0; }
+    if (m.includes('sonnet')) { inPrice = 3.0; outPrice = 15.0; }
     else if (m.includes('opus')) { inPrice = 15.0; outPrice = 75.0; }
-    else if (m.includes('haiku')) { inPrice = 0.25; outPrice = 1.25; }
-    // OpenAI
-    else if (m.includes('gpt-5') && !m.includes('mini')) { inPrice = 10.0; outPrice = 30.0; }
-    else if (m.includes('gpt-5-mini') || m.includes('gpt-5.2-mini') || m.includes('gpt-4o-mini')) { inPrice = 0.15; outPrice = 0.6; }
-    else if (m.includes('gpt-4o')) { inPrice = 2.5; outPrice = 10.0; }
-    else if (m.includes('gpt-4')) { inPrice = 30.0; outPrice = 60.0; }
-    // GitHub Copilot — 訂閱制
-    else if (m.startsWith('github-copilot/')) { label = '訂閱制'; }
-    // Google — 依方案
-    else if (m.startsWith('google/') || m.startsWith('google-vertex/') || m.includes('gemini')) { label = 'Google (依方案)'; }
+    else if (m.includes('github-copilot') || m.startsWith('github-copilot/')) { label = '訂閱制'; }
+    else if (m.includes('google/') || m.startsWith('google/')) { label = '免費'; }
     if (label !== null) return { cost: 0, label };
     const cost = (tokens * 0.3 / 1e6) * inPrice + (tokens * 0.7 / 1e6) * outPrice;
     return { cost, label: null };
   }
   const costSessions = (data.sessions || []).filter(s => (s.totalTokens || 0) > 0);
-  // 按 provider 分開累計費用
-  const providerCosts = {};
+  let totalAnthropicCost = 0;
   let costRows = '';
   for (const s of costSessions) {
     const tokens = s.totalTokens || 0;
     const { cost, label } = modelCost(s.model, tokens);
-    const provider = resolveProvider(s.model);
-    if (cost > 0) {
-      providerCosts[provider] = (providerCosts[provider] || 0) + cost;
-    }
+    const isAnthropicModel = (s.model||'').toLowerCase().includes('sonnet') || (s.model||'').toLowerCase().includes('opus');
+    if (isAnthropicModel) totalAnthropicCost += cost;
     const costStr = label ? `<span style="color:#64748b">${label}</span>`
       : cost > 0 ? `<span style="color:#fde68a">$${cost.toFixed(4)}</span>`
       : '<span style="color:#4b5563">$0.0000</span>';
     const keyShort = (s.key || s.sessionKey || '—').slice(0, 30);
-    const modelShort = (s.model || '—').slice(0, 28);
+    const modelShort = (s.model || '—').slice(0, 25);
     costRows += `<tr>
       <td style="padding:6px 10px;font-size:.82rem;color:#94a3b8;font-family:monospace">${escHtml(keyShort)}</td>
       <td style="padding:6px 10px;font-size:.78rem;color:#64748b">${escHtml(modelShort)}</td>
       <td style="padding:6px 10px;font-size:.82rem;color:#e2e8f0;text-align:right">${tokens.toLocaleString()}</td>
       <td style="padding:6px 10px;font-size:.82rem;text-align:right">${costStr}</td>
     </tr>`;
-  }
-  // 合計列 — 每個有費用的 provider 各顯示一行
-  const providerLabels = { anthropic: 'Anthropic', openai: 'OpenAI', google: 'Google', 'github-copilot': 'GitHub Copilot', other: 'Other' };
-  let footerRows = '';
-  const hasCost = Object.keys(providerCosts).length > 0;
-  if (hasCost) {
-    for (const [prov, total] of Object.entries(providerCosts)) {
-      footerRows += `<tr style="border-top:1px solid #2d3154;background:#0f1117">
-        <td colspan="3" style="padding:6px 10px;font-size:.84rem;color:#a78bfa;font-weight:600">合計 ${providerLabels[prov] || prov} 費用</td>
-        <td style="padding:6px 10px;text-align:right;font-size:.88rem;font-weight:700;color:#fde68a">$${total.toFixed(4)} USD</td>
-      </tr>`;
-    }
   }
   const costCard = costSessions.length === 0
     ? '<div style="color:#4b5563;font-size:.84rem;padding:8px 0">無 Token 使用紀錄</div>'
@@ -3919,7 +3480,10 @@ function renderStatus(data) {
           <th style="padding:6px 10px;text-align:right;color:#64748b;font-weight:500">費用估算</th>
         </tr></thead>
         <tbody>${costRows}</tbody>
-        ${hasCost ? `<tfoot>${footerRows}</tfoot>` : ''}
+        <tfoot><tr style="border-top:2px solid #2d3154;background:#0f1117">
+          <td colspan="3" style="padding:8px 10px;font-size:.84rem;color:#a78bfa;font-weight:600">合計 Anthropic 費用</td>
+          <td style="padding:8px 10px;text-align:right;font-size:.88rem;font-weight:700;color:#fde68a">$${totalAnthropicCost.toFixed(4)} USD</td>
+        </tr></tfoot>
       </table></div>`;
 
   // ── Cron Jobs ─────────────────────────────────────────────────────────────
@@ -4089,25 +3653,6 @@ function renderStatus(data) {
   `;
 
   document.getElementById('last-updated').textContent = '最後更新：' + data.collectedAt + ' (Asia/Taipei)';
-}
-
-async function gameControl(action) {
-  const label = action === 'start' ? '啟動' : action === 'stop' ? '停止' : '重啟';
-  try {
-    const r = await fetch(`/api/game_control?action=${action}`, {
-      method: 'POST',
-      credentials: 'include'
-    });
-    const data = await r.json();
-    if (data.ok) {
-      alert(`✅ city-game ${label}成功！目前狀態：${data.status}`);
-    } else {
-      alert(`❌ ${label}失敗：${data.stderr || data.stdout || '未知錯誤'}`);
-    }
-    refreshStatus();
-  } catch(e) {
-    alert(`❌ 請求失敗：${e.message}`);
-  }
 }
 
 async function refreshStatus() {
