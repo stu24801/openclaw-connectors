@@ -2717,7 +2717,10 @@ def share_view_get(article_id: str, request: Request, v: Optional[str] = None):
     <div class="card">
         <div style="margin-bottom:24px;border-bottom:1px solid #2d3154;padding-bottom:16px;">
             <h1 style="color:#e2e8f0;margin:0 0 8px 0;">{am['title']}</h1>
-            <div style="color:#94a3b8;font-size:0.9rem;">✍️ 作者: {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+                <div style="color:#94a3b8;font-size:0.9rem;">✍️ 作者: {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+                <a href="/share/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none;font-size:0.8rem;padding:4px 10px;min-height:auto;">⬇ 下載 Markdown</a>
+            </div>
         </div>
         <div id="rendered"></div>
     </div>
