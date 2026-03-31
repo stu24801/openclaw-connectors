@@ -37,9 +37,22 @@ WRITER_PASSWORD = os.getenv("WRITER_PASSWORD", "")
 # ── Articles (writer uploads) ─────────────────────────────────────────────────
 ARTICLES_DIR      = DATA_DIR / "articles"
 ARTICLEMETA_PATH  = DATA_DIR / "articlemeta.json"
+GRADE_CACHE_PATH  = DATA_DIR / "grade_cache.json"
 
 # ── In-memory session store ───────────────────────────────────────────────────
 _sessions: set = set()
+
+# ── Grade cache helpers ───────────────────────────────────────────────────────
+_grade_cache: dict = {}  # "owner/repo@branch" → {report, prompt, cached_at, repo_url}
+
+def _load_grade_cache():
+    global _grade_cache
+    _grade_cache = json.loads(GRADE_CACHE_PATH.read_text()) if GRADE_CACHE_PATH.exists() else {}
+
+def _save_grade_cache():
+    GRADE_CACHE_PATH.write_text(json.dumps(_grade_cache, ensure_ascii=False, indent=2))
+
+_load_grade_cache()
 
 # ── Article messages (feedback) ───────────────────────────────────────────────
 ARTICLE_MESSAGES_PATH = DATA_DIR / "article_messages.json"
@@ -211,11 +224,33 @@ def _ask_writer_agent(article_id: str, owner_message: str):
         f"「{owner_message}」\n\n"
         f"📄 文章 ID：{article_id}\n"
         f"🔗 對話介面：https://rag.alex-stu24801.com/articles/{article_id}\n\n"
-        f"請你立即回覆景揚。步驟：\n"
-        f"1. 透過 POST https://rag.alex-stu24801.com/articles/{article_id}/messages 回覆\n"
-        f"   （X-Writer-Token header，使用自然對話口吻，簡短即可）\n"
-        f"2. 若需要修改文章內容，再透過 POST https://rag.alex-stu24801.com/articles/{article_id}/revise 提交修改版\n"
-        f"⚠️ 回覆訊息時，『絕對不要』貼出整篇文章或任何文章片段，只需用簡短自然的對話告訴景揚你的想法或已完成的修改。"
+        f"請依照以下步驟處理：\n\n"
+        f"【步驟 1】先下載原文（必做，不可跳過）\n"
+        f"curl -s -H 'X-Writer-Token: writer123' \\\n"
+        f"  https://rag.alex-stu24801.com/articles/{article_id}/download \\\n"
+        f"  -o /tmp/article_{article_id[:8]}.md\n\n"
+        f"【步驟 2】在對話視窗回覆景揚（讓他知道你已收到）\n"
+        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages \\\n"
+        f"  -H 'Content-Type: application/json' \\\n"
+        f"  -H 'X-Writer-Token: writer123' \\\n"
+        f"  -d '{{\"content\": \"收到！正在處理，請稍候。\"}}'\n\n"
+        f"【步驟 3】局部修改文章（🔴 嚴格守則）\n"
+        f"- 只修改景揚明確要求的段落，其餘所有內容必須與原文完全一致\n"
+        f"- 禁止「順手」改寫未被要求的段落、標題或措辭\n"
+        f"- 修改完成後，用 diff 確認變動範圍符合要求：\n"
+        f"  diff /tmp/article_{article_id[:8]}.md /tmp/revised_{article_id[:8]}.md\n"
+        f"- 若 diff 顯示超出要求範圍的變動，立刻撤銷多餘修改\n\n"
+        f"【步驟 4】提交修改版（必須用 multipart/form-data，不是 JSON）\n"
+        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/revise \\\n"
+        f"  -H 'X-Writer-Token: writer123' \\\n"
+        f"  -F 'file=@/tmp/revised_{article_id[:8]}.md;type=text/markdown' \\\n"
+        f"  -F 'note=修改說明（簡述改了哪個段落）'\n\n"
+        f"【步驟 5】在對話視窗告知景揚已完成\n"
+        f"curl -s -X POST https://rag.alex-stu24801.com/articles/{article_id}/messages \\\n"
+        f"  -H 'Content-Type: application/json' \\\n"
+        f"  -H 'X-Writer-Token: writer123' \\\n"
+        f"  -d '{{\"content\": \"已完成修改，只調整了 [段落名稱]，其餘內容維持原樣。\"}}'\n\n"
+        f"⚠️ 對話視窗的 content 只能是簡短說明，絕對不要貼出文章片段或全文。"
     )
 
     payload = {
@@ -306,6 +341,28 @@ def startup():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _share_html(body: str, title: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
+  .btn{{display:inline-block;padding:8px 16px;border-radius:6px;font-size:0.9rem;cursor:pointer;text-align:center;border:none;color:#fff;text-decoration:none;transition:background .2s}}
+  .btn-primary{{background:#4f46e5;color:#fff}}
+  .btn-primary:hover{{background:#4338ca}}
+</style>
+</head>
+<body>
+<div style="padding: 24px; max-width: 800px; margin: 0 auto;">
+{body}
+</div>
+</body>
+</html>"""
 
 def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = None) -> str:
     # Build sidebar category links
@@ -1461,35 +1518,7 @@ function doGrade() {{
 
     // Auto-call AI grading
     log('<span style="color:#60a5fa">🤖 正在呼叫 AI 評分（claude-sonnet-4.6）...</span>');
-    fetch('/ai_grade', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ prompt: _prompt, meta: _meta }})
-    }})
-    .then(r => {{
-      if (!r.ok) {{
-        return r.text().then(t => {{ throw new Error(`HTTP ${{r.status}}: ${{t.substring(0, 100)}}`); }});
-      }}
-      return r.json();
-    }})
-    .then(result => {{
-      if (result.auto) {{
-        _reportMd = result.report;
-        document.getElementById('report-card').style.display = 'block';
-        document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
-        log('<span style="color:#86efac">✅ AI 評分完成！</span>');
-        // Show chat panel
-        _chatHistory = [];
-        document.getElementById('chat-card').style.display = 'block';
-        document.getElementById('chat-messages').innerHTML = '';
-        appendChatMsg('assistant', '評分完成！您可以在這裡詢問任何關於評分結果的問題，例如：「第 3 題為何扣分？」、「如何改善這份作業？」、「幫我寫一份改進建議給同學」');
-      }} else {{
-        log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
-      }}
-    }})
-    .catch(e => {{
-      log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
-    }});
+    _callAiGrade(false);
   }});
 
   _sse.addEventListener('error', e => {{
@@ -1512,6 +1541,43 @@ function doGrade() {{
   }};
 }}
 
+function _callAiGrade(force) {{
+    fetch('/ai_grade', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ prompt: _prompt, meta: _meta, force: force }})
+    }})
+    .then(r => {{
+      if (!r.ok) {{
+        return r.text().then(t => {{ throw new Error(`HTTP ${{r.status}}: ${{t.substring(0, 100)}}`); }});
+      }}
+      return r.json();
+    }})
+    .then(result => {{
+      if (result.auto) {{
+        _reportMd = result.report;
+        document.getElementById('report-card').style.display = 'block';
+        document.getElementById('report-html').innerHTML = marked.parse(_reportMd);
+        // Show cache status
+        const cacheInfo = result.from_cache
+          ? '<span style="color:#fbbf24">⚡ 使用快取結果（' + escHtml(result.cached_at || '') + '）</span>'
+            + ' <button class="btn" style="font-size:.75rem;padding:3px 10px;margin-left:8px" onclick="_regrade()">🔄 重新評分</button>'
+          : '<span style="color:#86efac">✅ AI 評分完成！</span>';
+        log(cacheInfo);
+        // Show chat panel
+        _chatHistory = [];
+        document.getElementById('chat-card').style.display = 'block';
+        document.getElementById('chat-messages').innerHTML = '';
+        appendChatMsg('assistant', '評分完成！您可以在這裡詢問任何關於評分結果的問題，例如：「第 3 題為何扣分？」、「如何改善這份作業？」、「幫我寫一份改進建議給同學」');
+      }} else {{
+        log('<span style="color:#fbbf24">⚠️ ' + escHtml(result.message || 'AI 評分不可用') + '</span>');
+      }}
+    }})
+    .catch(e => {{
+      log('<span style="color:#fca5a5">❌ AI 評分呼叫失敗：' + escHtml(String(e)) + '</span>');
+    }});
+}}
+
 function stopGrade() {{
   if (_sse) {{ _sse.close(); _sse = null; }}
   document.getElementById('stop-btn').style.display = 'none';
@@ -1522,6 +1588,14 @@ function stopGrade() {{
     document.getElementById('prompt-card').style.display = 'block';
     document.getElementById('prompt-box').textContent = _prompt;
   }}
+}}
+
+function _regrade() {{
+  if (!_prompt) {{ alert('請先跑評分流程取得 Prompt'); return; }}
+  log('<span style="color:#60a5fa">🔄 強制重新評分（忽略快取）...</span>');
+  document.getElementById('report-card').style.display = 'none';
+  document.getElementById('chat-card').style.display = 'none';
+  _callAiGrade(true);
 }}
 
 function copyPrompt() {{
@@ -1764,6 +1838,21 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
             headers=headers,
             json=body,
         )
+        # 401 → token expired, wait for openclaw gateway to refresh (up to 15s), then retry
+        if resp.status_code == 401:
+            import asyncio as _asyncio
+            for _wait in (3, 5, 7):
+                await _asyncio.sleep(_wait)
+                new_token = _load_copilot_token()
+                if new_token and new_token != token:
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    token = new_token
+                    break
+            resp = await client.post(
+                "https://api.githubcopilot.com/chat/completions",
+                headers=headers,
+                json=body,
+            )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -1772,13 +1861,49 @@ async def _call_copilot_api(prompt: str, model: str = "claude-sonnet-4.6") -> st
 @app.post("/ai_grade")
 async def ai_grade(payload: dict):
     """Grade using GitHub Copilot API (claude-sonnet-4.6 via GitHub Copilot)."""
-    prompt = payload.get("prompt", "")
+    import time as _time
+    prompt   = payload.get("prompt", "")
+    meta     = payload.get("meta", {})       # {owner, repo, branch, repo_url, ...}
+    force    = payload.get("force", False)   # True = 強制重跑，忽略快取
+
     if not prompt:
         raise HTTPException(400, "prompt required")
 
+    # Build cache key from meta (owner/repo@branch)
+    cache_key = None
+    if meta.get("owner") and meta.get("repo"):
+        branch = meta.get("branch", "main")
+        cache_key = f"{meta['owner']}/{meta['repo']}@{branch}"
+
+    # Return from cache if available and not forced
+    if cache_key and not force and cache_key in _grade_cache:
+        cached = _grade_cache[cache_key]
+        return {
+            "report":    cached["report"],
+            "auto":      True,
+            "from_cache": True,
+            "cached_at": cached["cached_at"],
+            "cache_key": cache_key,
+        }
+
     try:
         report = await _call_copilot_api(prompt)
-        return {"report": report, "auto": True}
+
+        # Save to cache on success
+        if cache_key:
+            _grade_cache[cache_key] = {
+                "report":    report,
+                "prompt":    prompt,
+                "cached_at": _time.strftime("%Y-%m-%dT%H:%M:%S+08:00",
+                                            _time.localtime(_time.time() + 28800)),
+                "repo_url":  meta.get("repo_url", ""),
+                "owner":     meta.get("owner", ""),
+                "repo":      meta.get("repo", ""),
+                "branch":    meta.get("branch", ""),
+            }
+            _save_grade_cache()
+
+        return {"report": report, "auto": True, "from_cache": False, "cache_key": cache_key}
     except Exception as e:
         # Fallback: return prompt for manual use
         return {
@@ -1786,6 +1911,34 @@ async def ai_grade(payload: dict):
             "auto": False,
             "message": f"AI 評分失敗（{e}），請複製 Prompt 到 Claude / ChatGPT"
         }
+
+
+@app.get("/grade_cache")
+def list_grade_cache(rag_token: Optional[str] = Cookie(None)):
+    """List all cached grading results."""
+    if rag_token not in _sessions:
+        raise HTTPException(401, "Not authenticated")
+    result = []
+    for key, val in _grade_cache.items():
+        result.append({
+            "cache_key":  key,
+            "repo_url":   val.get("repo_url", ""),
+            "cached_at":  val.get("cached_at", ""),
+            "report_len": len(val.get("report", "")),
+        })
+    return {"caches": result, "total": len(result)}
+
+
+@app.delete("/grade_cache/{cache_key:path}")
+def delete_grade_cache(cache_key: str, rag_token: Optional[str] = Cookie(None)):
+    """Delete a cached grading result (force re-grade on next run)."""
+    if rag_token not in _sessions:
+        raise HTTPException(401, "Not authenticated")
+    if cache_key not in _grade_cache:
+        raise HTTPException(404, f"Cache key not found: {cache_key}")
+    del _grade_cache[cache_key]
+    _save_grade_cache()
+    return {"deleted": cache_key}
 
 
 @app.post("/chat_with_report")
@@ -1967,7 +2120,17 @@ async def writer_api_submit(request: Request):
     x_token = request.headers.get("X-Writer-Token", "")
     if not secrets.compare_digest(x_token, WRITER_PASSWORD):
         raise HTTPException(401, "Invalid writer token")
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"JSON parse error: {e}. "
+            "Hint: If submitting via curl shell, use a temp file to avoid shell escaping issues. "
+            "Example: echo '{\"title\":\"T\",\"author\":\"A\",\"content\":\"...\"}' > /tmp/p.json && "
+            "curl -X POST .../writer/api/submit -H 'Content-Type: application/json' "
+            "-H 'X-Writer-Token: writer123' --data-binary @/tmp/p.json"
+        )
     title   = (payload.get("title") or "").strip()
     author  = (payload.get("author") or "").strip()
     content = (payload.get("content") or "").strip()
@@ -2165,6 +2328,64 @@ def writer_article_view(article_id: str, writer_token: Optional[str] = Cookie(No
     <button class="btn" type="submit" style="background:#059669">📨 送出修改版</button>
   </form>
 </div>
+
+
+<!-- 分享設定 Modal -->
+<div id="share-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#1a1d2e;padding:24px;border-radius:12px;width:400px;border:1px solid #2d3154;box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+    <h3 style="margin-top:0;color:#e2e8f0;">🔗 分享文章</h3>
+    <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:16px;">開啟分享後，其他人可透過連結並輸入密碼觀看此文章。</p>
+    <div style="margin-bottom:16px;">
+      <label style="color:#e2e8f0;font-size:0.9rem;font-weight:600;">設定密碼（留空則停用分享）：</label>
+      <input type="text" id="share-pwd-input" value="{am.get('share_pwd', '')}" placeholder="請輸入密碼" style="width:100%;margin-top:8px;padding:10px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:24px;">
+      <label style="color:#e2e8f0;font-size:0.9rem;font-weight:600;">分享連結：</label>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <input type="text" id="share-link-input" readonly value="https://rag.alex-stu24801.com/share/{article_id}" style="flex:1;padding:8px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#94a3b8;font-size:0.85rem;box-sizing:border-box;">
+        <button class="btn btn-sm" onclick="copyShareLink()" style="padding:0 12px;">複製</button>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:12px;">
+      <button class="btn btn-sm btn-ghost" onclick="document.getElementById('share-modal').style.display='none'">取消</button>
+      <button class="btn btn-sm" onclick="saveShareSettings()" id="share-save-btn">儲存設定</button>
+    </div>
+  </div>
+</div>
+<script>
+function toggleShareModal() {{
+  document.getElementById('share-modal').style.display = 'flex';
+}}
+function copyShareLink() {{
+  const link = document.getElementById('share-link-input');
+  link.select();
+  document.execCommand('copy');
+  alert('已複製分享連結');
+}}
+async function saveShareSettings() {{
+  const btn = document.getElementById('share-save-btn');
+  btn.innerText = '儲存中...';
+  btn.disabled = true;
+  const pwd = document.getElementById('share-pwd-input').value;
+  try {{
+    const res = await fetch(`/api/articles/${{ARTICLE_ID}}/share`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{password: pwd}})
+    }});
+    if(res.ok) {{
+      alert(pwd ? '已啟用分享並設定密碼' : '已停用分享');
+      document.getElementById('share-modal').style.display='none';
+    }} else {{
+      alert('儲存失敗');
+    }}
+  }} catch (e) {{
+    alert('網路錯誤：' + e);
+  }}
+  btn.innerText = '儲存設定';
+  btn.disabled = false;
+}}
+</script>
 
 <!-- 固定懸浮的重新載入按鈕 -->
 <style>
@@ -2559,6 +2780,7 @@ def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[s
         {f'<div style="font-size:.8rem;color:#4b5563;margin-top:4px">備註：{am["note"]}</div>' if am.get('note') else ''}
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;flex-shrink:0">
+        <button onclick="toggleShareModal()" class="btn btn-sm btn-ghost" style="text-decoration:none; color:#fbbf24; border-color:rgba(251,191,36,0.3)">🔗 分享</button>
         <a href="/articles/{article_id}/download" class="btn btn-sm btn-ghost" style="text-decoration:none">⬇ 下載 .md</a>
         <a href="/articles" class="btn btn-sm btn-ghost" style="text-decoration:none">← 回列表</a>
       </div>
@@ -2566,6 +2788,64 @@ def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[s
     <div id="rendered" style="line-height:1.8;color:#cbd5e1;font-size:.95rem;max-width:100%;overflow:hidden;word-break:break-word;overflow-wrap:break-word"></div>
   </div>
 </div>
+
+
+<!-- 分享設定 Modal -->
+<div id="share-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#1a1d2e;padding:24px;border-radius:12px;width:400px;border:1px solid #2d3154;box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+    <h3 style="margin-top:0;color:#e2e8f0;">🔗 分享文章</h3>
+    <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:16px;">開啟分享後，其他人可透過連結並輸入密碼觀看此文章。</p>
+    <div style="margin-bottom:16px;">
+      <label style="color:#e2e8f0;font-size:0.9rem;font-weight:600;">設定密碼（留空則停用分享）：</label>
+      <input type="text" id="share-pwd-input" value="{am.get('share_pwd', '')}" placeholder="請輸入密碼" style="width:100%;margin-top:8px;padding:10px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:24px;">
+      <label style="color:#e2e8f0;font-size:0.9rem;font-weight:600;">分享連結：</label>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <input type="text" id="share-link-input" readonly value="https://rag.alex-stu24801.com/share/{article_id}" style="flex:1;padding:8px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#94a3b8;font-size:0.85rem;box-sizing:border-box;">
+        <button class="btn btn-sm" onclick="copyShareLink()" style="padding:0 12px;">複製</button>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:12px;">
+      <button class="btn btn-sm btn-ghost" onclick="document.getElementById('share-modal').style.display='none'">取消</button>
+      <button class="btn btn-sm" onclick="saveShareSettings()" id="share-save-btn">儲存設定</button>
+    </div>
+  </div>
+</div>
+<script>
+function toggleShareModal() {{
+  document.getElementById('share-modal').style.display = 'flex';
+}}
+function copyShareLink() {{
+  const link = document.getElementById('share-link-input');
+  link.select();
+  document.execCommand('copy');
+  alert('已複製分享連結');
+}}
+async function saveShareSettings() {{
+  const btn = document.getElementById('share-save-btn');
+  btn.innerText = '儲存中...';
+  btn.disabled = true;
+  const pwd = document.getElementById('share-pwd-input').value;
+  try {{
+    const res = await fetch(`/api/articles/${{ARTICLE_ID}}/share`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{password: pwd}})
+    }});
+    if(res.ok) {{
+      alert(pwd ? '已啟用分享並設定密碼' : '已停用分享');
+      document.getElementById('share-modal').style.display='none';
+    }} else {{
+      alert('儲存失敗');
+    }}
+  }} catch (e) {{
+    alert('網路錯誤：' + e);
+  }}
+  btn.innerText = '儲存設定';
+  btn.disabled = false;
+}}
+</script>
 
 <!-- 固定懸浮的重新載入按鈕 -->
 <style>
@@ -3167,6 +3447,43 @@ def _collect_system_status() -> dict:
         pass
     services.append({"name": "llm-proxy (port 9000)", "status": "active" if llm_proxy_ok else "inactive", "ok": llm_proxy_ok})
 
+    # city-game (PM2)
+    city_game_status = "unknown"
+    city_game_ok = False
+    try:
+        pm2_result = subprocess.run(
+            ["/home/millalex921/.npm-global/bin/pm2", "jlist"],
+            capture_output=True, text=True, timeout=5
+        )
+        if pm2_result.returncode == 0:
+            pm2_list = json.loads(pm2_result.stdout)
+            for proc in pm2_list:
+                if proc.get("name") == "city-game":
+                    pm2_status = proc.get("pm2_env", {}).get("status", "unknown")
+                    city_game_status = pm2_status
+                    city_game_ok = (pm2_status == "online")
+                    break
+            else:
+                city_game_status = "not found"
+    except Exception:
+        city_game_status = "error"
+
+    # HTTP health check
+    city_game_http = False
+    try:
+        req = urllib.request.Request("http://127.0.0.1:3003/", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            city_game_http = (resp.status == 200)
+    except Exception:
+        pass
+
+    services.append({
+        "name": "city-game (port 3003)",
+        "status": city_game_status if city_game_ok else ("stopped" if city_game_status != "error" else "error"),
+        "ok": city_game_ok and city_game_http,
+        "extra": f"HTTP {'✅' if city_game_http else '❌'} | PM2 {city_game_status}"
+    })
+
     # 9. WhatsApp session status
     wa_dir = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
     wa_status = {"exists": False, "hasCreds": False, "fileCount": 0}
@@ -3229,6 +3546,46 @@ def _collect_system_status() -> dict:
         "agentConfigs": agent_configs,
         "contextSettings": context_settings,
     }
+
+
+@app.post("/api/game_control")
+def api_game_control(action: str, rag_token: Optional[str] = Cookie(None)):
+    """控制 city-game PM2 進程 (start/stop/restart)"""
+    if not _auth(rag_token):
+        raise HTTPException(401, "Not authenticated")
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(400, f"Invalid action: {action}")
+    pm2 = "/home/millalex921/.npm-global/bin/pm2"
+    try:
+        result = subprocess.run(
+            [pm2, action, "city-game"],
+            capture_output=True, text=True, timeout=15
+        )
+        import time; time.sleep(2)
+        status_result = subprocess.run(
+            [pm2, "jlist"],
+            capture_output=True, text=True, timeout=10
+        )
+        current_status = "unknown"
+        if status_result.returncode == 0:
+            try:
+                pm2_list = json.loads(status_result.stdout)
+                for proc in pm2_list:
+                    if proc.get("name") == "city-game":
+                        current_status = proc.get("pm2_env", {}).get("status", "unknown")
+            except Exception:
+                pass
+        return {
+            "ok": result.returncode == 0,
+            "action": action,
+            "status": current_status,
+            "stdout": result.stdout[-500:] if result.stdout else "",
+            "stderr": result.stderr[-200:] if result.stderr else ""
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "PM2 command timed out")
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/sys_status")
@@ -3378,11 +3735,17 @@ function renderStatus(data) {
   // ── 服務狀態 ─────────────────────────────────────────────────────────────
   const svcRows = (data.services || []).map(s => {
     const badge = s.ok ? '<span class="badge-ok">● active</span>' : `<span class="badge-err">● ${escHtml(s.status)}</span>`;
+    const isGame = s.name && s.name.includes('city-game');
+    const controlBtns = isGame ? `
+      <span style="display:inline-flex;gap:6px;margin-left:8px">
+        <button onclick="gameControl('start')" style="background:#052e16;color:#86efac;border:1px solid #166534;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">▶ 啟動</button>
+        <button onclick="gameControl('stop')" style="background:#450a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:5px;padding:2px 9px;font-size:.74rem;cursor:pointer">⏹ 停止</button>
+      </span>` : '';
     return `<div class="stat-row">
       <span class="stat-label" style="display:flex;align-items:center;gap:7px">
         <span class="dot ${s.ok ? 'dot-green' : 'dot-red'}"></span>${escHtml(s.name)}
       </span>
-      ${badge}
+      <span style="display:flex;align-items:center;gap:4px">${badge}${controlBtns}</span>
     </div>`;
   }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無服務資訊</span></div>';
 
@@ -3686,6 +4049,25 @@ function renderStatus(data) {
   document.getElementById('last-updated').textContent = '最後更新：' + data.collectedAt + ' (Asia/Taipei)';
 }
 
+async function gameControl(action) {
+  const label = action === 'start' ? '啟動' : action === 'stop' ? '停止' : '重啟';
+  try {
+    const r = await fetch(`/api/game_control?action=${action}`, {
+      method: 'POST',
+      credentials: 'include'
+    });
+    const data = await r.json();
+    if (data.ok) {
+      alert(`✅ city-game ${label}成功！目前狀態：${data.status}`);
+    } else {
+      alert(`❌ ${label}失敗：${data.stderr || data.stdout || '未知錯誤'}`);
+    }
+    refreshStatus();
+  } catch(e) {
+    alert(`❌ 請求失敗：${e.message}`);
+  }
+}
+
 async function refreshStatus() {
   const btn = document.getElementById('refresh-btn');
   btn.disabled = true;
@@ -3711,3 +4093,159 @@ refreshStatus();
 </script>
 """
     return HTMLResponse(_base_html(body, "系統狀態 — RAG KB"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Share Routes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/share/{article_id}", response_class=HTMLResponse)
+def share_view_get(article_id: str, request: Request, v: Optional[str] = None):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am or not am.get("share_enabled"):
+        body = "<div style='text-align:center;padding:50px;color:#e2e8f0;'>此文章未開放分享或已移除。</div>"
+        return HTMLResponse(_share_html(body, "文章未分享"))
+    
+    auth_cookie = request.cookies.get(f"share_auth_{article_id}")
+    if not auth_cookie or auth_cookie != am.get("share_pwd"):
+        body = f'''
+        <div style="max-width:400px;margin:100px auto;padding:32px;background:#1a1d2e;border-radius:12px;border:1px solid #2d3154;text-align:center;box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+          <h2 style="color:#e2e8f0;margin-top:0">🔒 密碼保護文章</h2>
+          <p style="color:#94a3b8;font-size:0.95rem;margin-bottom:24px;line-height:1.5">請輸入密碼以閱讀<br><span style="color:#a78bfa;font-weight:bold;">《{am['title']}》</span></p>
+          <form method="POST" action="/share/{article_id}">
+            <input type="password" name="pwd" placeholder="請輸入密碼" required style="width:100%;padding:12px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;margin-bottom:20px;box-sizing:border-box;font-size:1rem;">
+            <button type="submit" class="btn" style="width:100%;padding:10px;font-size:1rem;">解鎖文章</button>
+            {f'<input type="hidden" name="v" value="{v}">' if v else ''}
+          </form>
+        </div>
+        '''
+        return HTMLResponse(_share_html(body, "解鎖文章"))
+        
+    versions = am.get("versions", [])
+    if not versions:
+        am["versions"] = [{"id": "v1", "timestamp": am.get("uploaded_at"), "path": am.get("path")}]
+        versions = am["versions"]
+        
+    path = Path(am["path"])
+    selected_ver = next((x for x in versions if x["id"] == v), None) if v else None
+    if selected_ver:
+        path = Path(selected_ver["path"])
+
+    content_text = path.read_text(encoding="utf-8") if path.exists() else "（檔案遺失）"
+    content_escaped = json.dumps(content_text)
+
+    version_select_html = ""
+    if len(versions) > 1:
+        options = []
+        for ver in reversed(versions):
+            selected = "selected" if (v == ver["id"]) or (not v and ver["path"] == am["path"]) else ""
+            label = f"版本 {ver['id']} ({ver['timestamp']})"
+            options.append(f'<option value="{ver["id"]}" {selected}>{label}</option>')
+        
+        version_select_html = f'''
+        <div style="margin-top:8px">
+          <select onchange="window.location.href='/share/{article_id}?v=' + this.value" 
+                  style="background:#1e2235;color:#e2e8f0;border:1px solid #2d3154;padding:4px 8px;border-radius:4px;font-size:0.85rem;cursor:pointer">
+            {''.join(options)}
+          </select>
+        </div>
+        '''
+
+    body = f'''
+<style>
+  .container{{max-width:800px!important;padding:24px!important;margin:0 auto!important}}
+  #rendered{{line-height:1.8;color:#cbd5e1;font-size:.95rem;word-break:break-word;overflow-wrap:break-word;padding:12px 0;}}
+  #rendered h1,#rendered h2,#rendered h3{{color:#a78bfa;margin:1.2em 0 .5em;word-break:break-word}}
+  #rendered p{{margin-bottom:.9em}}
+  #rendered code{{background:#0f1117;padding:2px 6px;border-radius:4px;font-size:.85em;color:#86efac;word-break:break-all}}
+  #rendered pre{{background:#0f1117;border:1px solid #2d3154;border-radius:8px;padding:14px;overflow-x:auto;margin-bottom:1em;max-width:100%}}
+  #rendered pre code{{background:none;padding:0;word-break:normal}}
+  #rendered blockquote{{border-left:3px solid #a78bfa;padding-left:14px;color:#94a3b8;margin-bottom:1em}}
+  #rendered a{{color:#60a5fa;word-break:break-all}}
+  #rendered ul,#rendered ol{{padding-left:1.5em;margin-bottom:.9em}}
+  #rendered img{{max-width:100%;height:auto;border-radius:8px;display:block}}
+  #rendered hr{{border:none;border-top:1px solid #2d3154;margin:1.5em 0}}
+  #rendered table{{width:100%;border-collapse:collapse;font-size:.85rem;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  #rendered th{{text-align:left;padding:8px 10px;background:#0f1117;color:#64748b;border-bottom:1px solid #2d3154}}
+  #rendered td{{padding:8px 10px;border-bottom:1px solid #1e2235;vertical-align:top}}
+</style>
+
+<div class="card" style="margin-top:20px;padding:30px;">
+  <div style="margin-bottom:24px;border-bottom:1px solid #2d3154;padding-bottom:16px;">
+    <h1 style="font-size:1.8rem;color:#e2e8f0;margin-bottom:8px;margin-top:0;">{am['title']}</h1>
+    <div style="font-size:.9rem;color:#64748b">✍️ {am.get('author','—')} &nbsp;·&nbsp; {am.get('uploaded_at','')}</div>
+    {version_select_html}
+  </div>
+  <div id="rendered"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({{startOnLoad:false,theme:'dark'}});
+function renderMermaid(){{
+  document.querySelectorAll('code.language-mermaid').forEach(function(code){{
+    var pre=code.parentElement;
+    if(pre.tagName==='PRE'){{
+      var div=document.createElement('div');div.className='mermaid';div.textContent=code.textContent;
+      pre.parentElement.replaceChild(div,pre);
+    }}
+  }});
+  mermaid.init(undefined,document.querySelectorAll('.mermaid'));
+}}
+document.getElementById('rendered').innerHTML = marked.parse({content_escaped});
+renderMermaid();
+</script>
+    '''
+    return HTMLResponse(_share_html(body, am['title']))
+
+@app.post("/share/{article_id}", response_class=HTMLResponse)
+def share_post(article_id: str, pwd: str = Form(...), v: Optional[str] = Form(None)):
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am or not am.get("share_enabled"):
+        body = "<div style='text-align:center;padding:50px;color:#e2e8f0;'>此文章未開放分享或已移除。</div>"
+        return HTMLResponse(_share_html(body, "文章未分享"))
+    
+    if pwd != am.get("share_pwd"):
+        body = f'''
+        <div style="max-width:400px;margin:100px auto;padding:32px;background:#1a1d2e;border-radius:12px;border:1px solid #ef4444;text-align:center;box-shadow:0 10px 25px rgba(239,68,68,0.2);">
+          <h2 style="color:#e2e8f0;margin-top:0">❌ 密碼錯誤</h2>
+          <p style="color:#ef4444;font-size:0.95rem;margin-bottom:24px;">您輸入的密碼不正確，請重試。</p>
+          <form method="POST" action="/share/{article_id}">
+            <input type="password" name="pwd" placeholder="請輸入密碼" required style="width:100%;padding:12px;border-radius:6px;border:1px solid #2d3154;background:#0f1117;color:#e2e8f0;margin-bottom:20px;box-sizing:border-box;font-size:1rem;">
+            <button type="submit" class="btn" style="width:100%;padding:10px;font-size:1rem;">解鎖文章</button>
+            {f'<input type="hidden" name="v" value="{v}">' if v else ''}
+          </form>
+        </div>
+        '''
+        return HTMLResponse(_share_html(body, "密碼錯誤"), status_code=401)
+        
+    url = f"/share/{article_id}" + (f"?v={v}" if v else "")
+    response = RedirectResponse(url, status_code=303)
+    response.set_cookie(key=f"share_auth_{article_id}", value=pwd, max_age=86400*30)
+    return response
+
+@app.post("/api/articles/{article_id}/share")
+async def share_article_api(article_id: str, request: Request, rag_token: Optional[str] = Cookie(None)):
+    if not _auth(rag_token):
+        raise HTTPException(401, "Unauthorized")
+    
+    am = next((a for a in _articlemeta if a["id"] == article_id), None)
+    if not am:
+        raise HTTPException(404, "Article not found")
+        
+    try:
+        body = await request.json()
+        pwd = body.get("password", "").strip()
+    except:
+        pwd = ""
+        
+    if pwd:
+        am["share_pwd"] = pwd
+        am["share_enabled"] = True
+    else:
+        am["share_pwd"] = ""
+        am["share_enabled"] = False
+        
+    _save_articlemeta()
+    return {"status": "ok", "share_enabled": am["share_enabled"]}

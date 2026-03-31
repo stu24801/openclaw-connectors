@@ -342,6 +342,28 @@ def startup():
 #  HTML helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def _share_html(body: str, title: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
+  .btn{{display:inline-block;padding:8px 16px;border-radius:6px;font-size:0.9rem;cursor:pointer;text-align:center;border:none;color:#fff;text-decoration:none;transition:background .2s}}
+  .btn-primary{{background:#4f46e5;color:#fff}}
+  .btn-primary:hover{{background:#4338ca}}
+</style>
+</head>
+<body>
+<div style="padding: 24px; max-width: 800px; margin: 0 auto;">
+{body}
+</div>
+</body>
+</html>"""
+
 def _base_html(body: str, title="RAG Knowledge Base", sidebar_cats: List[str] = None) -> str:
     # Build sidebar category links
     sidebar_html = ""
