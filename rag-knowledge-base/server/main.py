@@ -2669,7 +2669,6 @@ async function shareArticle(id) {
 """
     return HTMLResponse(_base_html(body, "文章庫 — RAG KB"))
 
-@app.get("/articles/{article_id}", response_class=HTMLResponse)
 
 # ── 分享功能 ───────────────────────────────────────────────────────────────
 @app.post("/articles/{article_id}/share")
@@ -2740,6 +2739,7 @@ def share_view_post(article_id: str, pwd: str = Form(...)):
     resp.set_cookie(key=f"share_auth_{article_id}", value=pwd, max_age=86400*30)
     return resp
 
+@app.get("/articles/{article_id}", response_class=HTMLResponse)
 def article_view(article_id: str, v: Optional[str] = None, rag_token: Optional[str] = Cookie(None)):
     if not _auth(rag_token):
         return RedirectResponse("/login")
