@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 OPENCLAW_GATEWAY_URL   = os.getenv("OPENCLAW_GATEWAY_URL",   "http://127.0.0.1:8080")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 WRITER_SESSION_KEY     = os.getenv("WRITER_SESSION_KEY",     "agent:main:main")
+OWNER_SESSION_KEY      = os.getenv("OWNER_SESSION_KEY",      "agent:engineer:main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.getenv("RAG_DATA_DIR", "./data"))
@@ -291,7 +292,7 @@ article_title: str, article_id: str, writer_name: str, reply_content: str) -> bo
     payload = {
         "tool": "sessions_send",
         "args": {
-            "sessionKey": "agent:main:main",
+            "sessionKey": OWNER_SESSION_KEY,
             "message": (
                 f"✍️ **寫手蝦（{writer_name}）回覆了你的回饋**\n\n"
                 f"📄 文章：**{article_title}**\n"
