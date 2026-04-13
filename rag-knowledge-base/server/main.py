@@ -3692,6 +3692,213 @@ async def api_change_password(
     return {"ok": True, "persisted": persisted}
 
 
+ENGRAM_FACTS_DIR = Path("/home/millalex921/.openclaw/workspace/memory/local/facts")
+USER_MD_PATH = Path("/home/millalex921/.openclaw/workspace/USER.md")
+
+
+def _parse_yaml_frontmatter(text: str) -> dict:
+    """Parse YAML front-matter from a markdown file."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    yaml_text = text[3:end].strip()
+    result = {}
+    for line in yaml_text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k = k.strip()
+            v = v.strip()
+            if v.startswith("[") and v.endswith("]"):
+                v = [x.strip().strip('"').strip("'") for x in v[1:-1].split(",") if x.strip()]
+            elif v.startswith('"') and v.endswith('"'):
+                v = v[1:-1]
+            elif v.replace(".", "").isdigit():
+                v = float(v) if "." in v else int(v)
+            result[k] = v
+    return result
+
+
+@app.post("/api/run_memory_audit_cleanup")
+async def run_memory_audit_cleanup(request: Request, rag_token: Optional[str] = Cookie(None)):
+    """Execute memory audit cleanup: dedup, expire, sync USER.md, remove test files."""
+    if not _auth(rag_token):
+        raise HTTPException(401, "Not authenticated")
+
+    deleted_files = []
+    before_count = 0
+    after_count = 0
+
+    if not ENGRAM_FACTS_DIR.exists():
+        return {"deletedFiles": [], "updatedUserMd": False, "syncedStocks": None,
+                "summary": "facts 目錄不存在，無需清理", "beforeCount": 0, "afterCount": 0}
+
+    all_md = list(ENGRAM_FACTS_DIR.rglob("*.md"))
+    before_count = len(all_md)
+
+    # Parse all files
+    parsed = []
+    for f in all_md:
+        try:
+            text = f.read_text(encoding="utf-8")
+            fm = _parse_yaml_frontmatter(text)
+            parsed.append({"path": f, "fm": fm, "mtime": f.stat().st_mtime, "text": text})
+        except Exception:
+            pass
+
+    to_delete = set()
+
+    # 1. Dedup: same category + tags overlap > 60%, different id
+    def tags_set(fm):
+        t = fm.get("tags", [])
+        if isinstance(t, str):
+            t = [x.strip() for x in t.split(",")]
+        return set(t)
+
+    for i in range(len(parsed)):
+        for j in range(i + 1, len(parsed)):
+            a, b = parsed[i], parsed[j]
+            if a["fm"].get("id") and b["fm"].get("id") and a["fm"].get("id") == b["fm"].get("id"):
+                continue
+            if a["fm"].get("category") and a["fm"].get("category") == b["fm"].get("category"):
+                ta, tb = tags_set(a["fm"]), tags_set(b["fm"])
+                if ta or tb:
+                    overlap = len(ta & tb) / max(len(ta | tb), 1)
+                    if overlap > 0.6:
+                        older = a if a["mtime"] < b["mtime"] else b
+                        to_delete.add(str(older["path"]))
+
+    # 2. Expired memories: tags contains one-time/override AND confidence <= 0.7
+    for p in parsed:
+        t = tags_set(p["fm"])
+        if ("one-time" in t or "override" in t):
+            conf = p["fm"].get("confidence", 1.0)
+            if isinstance(conf, (int, float)) and conf <= 0.7:
+                to_delete.add(str(p["path"]))
+
+    # 4. Test files
+    for f in ENGRAM_FACTS_DIR.rglob("*test*.md"):
+        to_delete.add(str(f))
+
+    # Delete marked files
+    for path_str in to_delete:
+        try:
+            Path(path_str).unlink()
+            deleted_files.append(path_str)
+        except Exception:
+            pass
+
+    after_count = before_count - len(deleted_files)
+
+    # 3. Sync USER.md stocks
+    synced_stocks = None
+    updated_user_md = False
+    tsmc_files = [p for p in parsed if "台積電" in p["text"] and str(p["path"]) not in to_delete]
+    if tsmc_files:
+        newest = max(tsmc_files, key=lambda x: x["mtime"])
+        text = newest["text"]
+        # Try to extract shares and avg price
+        shares_match = re.search(r"(?:持有|股數)[：:]\s*(\d[\d,]*)", text)
+        avg_match = re.search(r"(?:均價|平均成本)[：:]\s*([\d.]+)", text)
+        if shares_match or avg_match:
+            shares = shares_match.group(1).replace(",", "") if shares_match else None
+            avg = avg_match.group(1) if avg_match else None
+            today = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+            synced_stocks = {"shares": shares, "avgPrice": avg, "source": newest["path"].name}
+            if USER_MD_PATH.exists():
+                user_text = USER_MD_PATH.read_text(encoding="utf-8")
+                # Update or append 持股資訊 section
+                stock_section = f"\n## 持股資訊\n\n- **台積電（2330）**：{shares or '—'} 股，均價 {avg or '—'} 元\n- **更新日期**：{today}\n"
+                if "## 持股資訊" in user_text:
+                    user_text = re.sub(r"## 持股資訊.*?(?=\n## |\Z)", stock_section.lstrip(), user_text, flags=re.DOTALL)
+                else:
+                    user_text = user_text.rstrip() + "\n" + stock_section
+                USER_MD_PATH.write_text(user_text, encoding="utf-8")
+                updated_user_md = True
+
+    summary_parts = [f"清理前：{before_count} 筆記憶", f"清理後：{after_count} 筆記憶",
+                     f"刪除 {len(deleted_files)} 筆"]
+    if updated_user_md:
+        summary_parts.append("已同步 USER.md 持股資訊")
+    summary = "；".join(summary_parts)
+
+    return {
+        "deletedFiles": deleted_files,
+        "updatedUserMd": updated_user_md,
+        "syncedStocks": synced_stocks,
+        "summary": summary,
+        "beforeCount": before_count,
+        "afterCount": after_count,
+    }
+
+
+@app.post("/api/publish_memory_audit_report")
+async def publish_memory_audit_report(request: Request, rag_token: Optional[str] = Cookie(None)):
+    """Compose and publish memory audit cleanup report to the article library."""
+    if not _auth(rag_token):
+        raise HTTPException(401, "Not authenticated")
+
+    payload = await request.json()
+    today = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+    title = f"記憶稽核後續處理報告（{today}）"
+    deleted = payload.get("deletedFiles", [])
+    summary = payload.get("summary", "")
+    before = payload.get("beforeCount", 0)
+    after = payload.get("afterCount", 0)
+    synced = payload.get("syncedStocks")
+    updated_user = payload.get("updatedUserMd", False)
+
+    deleted_list_md = "\n".join(f"- `{Path(f).name}`" for f in deleted) if deleted else "- （無）"
+    stocks_md = ""
+    if synced:
+        stocks_md = f"\n## 持股同步\n\n- 台積電股數：{synced.get('shares', '—')}\n- 均價：{synced.get('avgPrice', '—')}\n- 來源檔案：`{synced.get('source', '—')}`\n"
+
+    content = f"""# {title}
+
+**執行時間**：{today}
+**執行者**：OpenClaw 主蝦
+
+## 執行摘要
+
+{summary}
+
+| 項目 | 數值 |
+|------|------|
+| 清理前記憶數 | {before} |
+| 清理後記憶數 | {after} |
+| 刪除筆數 | {len(deleted)} |
+| USER.md 更新 | {'是' if updated_user else '否'} |
+
+## 刪除的記憶檔案
+
+{deleted_list_md}
+{stocks_md}
+## 備註
+
+此報告由系統自動產生，記錄本次記憶稽核後續清理作業的執行結果。
+"""
+
+    article_id = str(uuid.uuid4())
+    slug = re.sub(r"[^\w\-]", "-", title.lower())[:60]
+    filename = f"{slug}.md"
+    save_path = ARTICLES_DIR / f"{article_id}.md"
+    save_path.write_text(content, encoding="utf-8")
+    _articlemeta.append({
+        "id": article_id,
+        "title": title,
+        "author": "OpenClaw 主蝦",
+        "note": "記憶稽核後續處理自動報告",
+        "filename": filename,
+        "size": len(content.encode()),
+        "uploaded_at": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
+        "path": str(save_path),
+    })
+    _save_articlemeta()
+    article_url = f"https://rag.alex-stu24801.com/articles/{article_id}"
+    return {"status": "ok", "article_id": article_id, "url": article_url, "title": title}
+
+
 @app.get("/api/sys_status")
 def api_sys_status(rag_token: Optional[str] = Cookie(None)):
     """JSON API: collect and return full system status."""
@@ -3762,6 +3969,7 @@ def sys_status_page(rag_token: Optional[str] = Cookie(None)):
     <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()" style="width:auto">
     每 30 秒自動刷新
   </label>
+  <button class="btn" id="memory-audit-btn" onclick="runMemoryAuditCleanup()" style="background:#1a1d2e;border:1px solid #6d28d9;color:#a78bfa">🧹 記憶稽核後續處理</button>
   <button class="btn" onclick="openChangePwdModal()" style="margin-left:auto">🔑 更改站台密碼</button>
   <div class="last-updated" id="last-updated">— 尚未載入 —</div>
 </div>
@@ -4305,6 +4513,25 @@ async function submitChangePassword() {
   } finally {
     btn.disabled = false;
     btn.textContent = '確認更改';
+  }
+}
+
+async function runMemoryAuditCleanup() {
+  const btn = document.getElementById('memory-audit-btn');
+  btn.disabled = true; btn.textContent = '⏳ 處理中…';
+  try {
+    const r1 = await fetch('/api/run_memory_audit_cleanup', {method:'POST'});
+    const cleanup = await r1.json();
+    const r2 = await fetch('/api/publish_memory_audit_report', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(cleanup)
+    });
+    const pub = await r2.json();
+    alert('✅ 清理完成！\n\n' + cleanup.summary + '\n\n報告已上架：' + (pub.url || pub.articleUrl || '（查看文章庫）'));
+  } catch(e) {
+    alert('❌ 執行失敗：' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '🧹 記憶稽核後續處理';
   }
 }
 </script>
