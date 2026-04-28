@@ -3249,7 +3249,7 @@ def _invoke_gateway_tool(tool: str, args: dict = {}) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-OPENCLAW_HOME = Path(os.path.expanduser("~/.openclaw"))
+OPENCLAW_HOME = Path(os.getenv("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
 
 
 def _read_openclaw_config() -> dict:
