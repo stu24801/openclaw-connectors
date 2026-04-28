@@ -3249,7 +3249,7 @@ def _invoke_gateway_tool(tool: str, args: dict = {}) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-OPENCLAW_HOME = Path(os.path.expanduser("~/.openclaw"))
+OPENCLAW_HOME = Path(os.getenv("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
 
 
 def _read_openclaw_config() -> dict:
@@ -3551,7 +3551,48 @@ def _collect_system_status() -> dict:
             "model": model,
         })
 
-    # 12. Context window settings
+    # 12. GitHub Copilot authorizations per agent
+    copilot_agents = []
+    agents_dir = OPENCLAW_HOME / "agents"
+    for agent_auth_path in sorted(agents_dir.glob("*/agent/auth-profiles.json")):
+        agent_name = agent_auth_path.parts[-3]  # agents/<name>/agent/auth-profiles.json
+        try:
+            ap = json.loads(agent_auth_path.read_text())
+            profiles_data = ap.get("profiles", {})
+            gh_profile = profiles_data.get("github-copilot:github", {})
+            ghu_token = gh_profile.get("token", "")
+            if not ghu_token:
+                copilot_agents.append({"agent": agent_name, "token": "—", "login": "—", "name": "—", "valid": False, "error": "no token"})
+                continue
+            try:
+                import urllib.request as _urlreq
+                req = _urlreq.Request(
+                    "https://api.github.com/user",
+                    headers={"Authorization": f"Bearer {ghu_token}", "Accept": "application/vnd.github.v3+json", "User-Agent": "openclaw-status"}
+                )
+                with _urlreq.urlopen(req, timeout=5) as resp:
+                    gh_user = json.loads(resp.read())
+                    copilot_agents.append({
+                        "agent": agent_name,
+                        "token": ghu_token[:8] + "…" + ghu_token[-4:],
+                        "login": gh_user.get("login", "—"),
+                        "name": gh_user.get("name", "—"),
+                        "valid": True,
+                        "error": "",
+                    })
+            except Exception as gh_e:
+                copilot_agents.append({
+                    "agent": agent_name,
+                    "token": ghu_token[:8] + "…" + ghu_token[-4:],
+                    "login": "—",
+                    "name": "—",
+                    "valid": False,
+                    "error": str(gh_e),
+                })
+        except Exception:
+            copilot_agents.append({"agent": agent_name, "token": "—", "login": "—", "name": "—", "valid": False, "error": "parse error"})
+
+    # 13. Context window settings
     defaults_cfg = cfg.get("agents", {}).get("defaults", {})
     context_settings = {
         "pruningMode": defaults_cfg.get("contextPruning", {}).get("mode", "—"),
@@ -3576,6 +3617,7 @@ def _collect_system_status() -> dict:
         "twilioInfo": twilio_info,
         "agentConfigs": agent_configs,
         "contextSettings": context_settings,
+        "copilotAgents": copilot_agents,
     }
 
 
@@ -4070,8 +4112,25 @@ function renderStatus(data) {
     </div>`;
   }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無授權設定</span></div>';
 
+  // ── GitHub Copilot 授權 ──────────────────────────────────────────────────
+  const copilotRows = (data.copilotAgents || []).map(c => {
+    const badge = c.valid
+      ? '<span class="badge-ok">✓ 有效</span>'
+      : `<span class="badge-err">✗ ${escHtml(c.error || '無效')}</span>`;
+    return `<div class="stat-row">
+      <span class="stat-label" style="display:flex;align-items:center;gap:7px">
+        <span class="dot ${c.valid ? 'dot-green' : 'dot-red'}"></span>
+        <span style="font-family:monospace">${escHtml(c.agent)}</span>
+      </span>
+      <span class="stat-val" style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+        <span style="display:flex;align-items:center;gap:6px">${badge}</span>
+        <span style="color:#94a3b8;font-size:.78rem">${escHtml(c.name)} <span style="color:#4b5563">(${escHtml(c.login)})</span></span>
+        <span style="color:#4b5563;font-size:.7rem;font-family:monospace">${escHtml(c.token)}</span>
+      </span>
+    </div>`;
+  }).join('') || '<div class="stat-row"><span class="stat-label" style="color:#4b5563">無資料</span></div>';
+
   // ── 服務狀態 ─────────────────────────────────────────────────────────────
-  const svcRows = (data.services || []).map(s => {
     const badge = s.ok ? '<span class="badge-ok">● active</span>' : `<span class="badge-err">● ${escHtml(s.status)}</span>`;
     const ctrlBtn = (s.docker || s.systemd || s.pm2)
       ? `<div style="margin-top:6px;display:flex;gap:6px">
@@ -4333,6 +4392,11 @@ function renderStatus(data) {
       <div class="status-card">
         <h3>🔐 授權設定（${(data.authProfiles||[]).length} 個）</h3>
         ${authRows}
+      </div>
+
+      <div class="status-card">
+        <h3>🐙 GitHub Copilot 授權（${(data.copilotAgents||[]).length} 個 Agent）</h3>
+        ${copilotRows}
       </div>
 
       <div class="status-card">

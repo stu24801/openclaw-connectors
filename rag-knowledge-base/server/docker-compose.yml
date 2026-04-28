@@ -7,10 +7,14 @@ services:
       - "8765"
     volumes:
       - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+      - /home/millalex921/.openclaw:/home/millalex921/.openclaw:ro
     env_file:
       - .env
     environment:
       RAG_DATA_DIR: /app/data
+      OPENCLAW_HOME: /home/millalex921/.openclaw
       RAG_CHUNK_SIZE: "500"
       RAG_TOP_K: "5"
     restart: unless-stopped
